@@ -270,7 +270,16 @@ failover:
 		_, err := l.execOK(muxNode, "test -S /run/wgmux/wgmuxd.sock")
 		return err == nil
 	})
-	out := l.exec(muxNode, "wgmuxctl apply -c /etc/wgmux/wgmux.yaml")
+	out, err := l.execOK(muxNode, "wgmuxctl apply -c /etc/wgmux/wgmux.yaml")
+	if err != nil {
+		diag, _ := l.execOK(muxNode, "echo '--- ip link'; ip link; "+
+			"echo '--- netns'; ip netns list; "+
+			"echo '--- backend links'; ip -n wgmux link 2>&1; "+
+			"echo '--- wg'; wg show all 2>&1; "+
+			"echo '--- bpf pins'; ls -laR /sys/fs/bpf 2>&1 | head -30; "+
+			"echo '--- wgmuxd log'; cat /var/log/wgmuxd.log")
+		l.t.Fatalf("apply failed: %v\n%s\ndiagnostics:\n%s", err, out, diag)
+	}
 	l.t.Logf("apply: %s", strings.TrimSpace(out))
 }
 

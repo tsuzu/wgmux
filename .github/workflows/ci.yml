@@ -38,6 +38,7 @@ jobs:
     env:
       WGMUX_E2E_ENGINE: ${{ matrix.engine }}
       WGMUX_E2E_INTERCONNECT: ${{ matrix.interconnect }}
+      WGMUX_E2E_KEEP: "1" # the dump step below inspects, then destroys
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
@@ -65,3 +66,4 @@ jobs:
             docker exec clab-wgmux-e2e-$n sh -c 'ip netns list; wg show all 2>/dev/null; ip -n wgmux link 2>/dev/null; cat /var/log/wgmuxd.log /var/log/http.log 2>/dev/null' || true
           done
           sudo containerlab inspect -t test/e2e/topology.clab.yml || true
+          sudo containerlab destroy -t test/e2e/topology.clab.yml --cleanup || true

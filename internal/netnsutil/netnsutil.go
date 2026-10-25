@@ -16,7 +16,24 @@ func CreateNamed(name string) (netns.NsHandle, error) {
 	if h, err := netns.GetFromName(name); err == nil {
 		return h, nil
 	}
+	// vishvananda/netns NewNamed unshares the CALLING thread into the
+	// new namespace and deliberately leaves namespace management to
+	// the caller. Pin this goroutine to its thread and restore the
+	// original namespace before unlocking, or the thread returns to
+	// the Go runtime pool still sitting in the new namespace and any
+	// later socket created on it (wgctrl, dials) lands in the wrong
+	// namespace.
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
+	orig, err := netns.Get()
+	if err != nil {
+		return -1, fmt.Errorf("save current netns: %w", err)
+	}
+	defer orig.Close()
 	h, err := netns.NewNamed(name)
+	if serr := netns.Set(orig); serr != nil && err == nil {
+		err = fmt.Errorf("restore netns after create: %w", serr)
+	}
 	if err == nil {
 		return h, nil
 	}
