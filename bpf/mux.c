@@ -90,10 +90,17 @@ const volatile __u32 own_peer_id;
 /* Maps                                                                */
 /* ------------------------------------------------------------------ */
 
+/* All maps are pinned by name: the daemon's runtime operations
+ * (activation, status, monitoring) address them through the pin
+ * directory long after the loading process has moved on. Without
+ * the pinning declaration cilium/ebpf silently skips pinning even
+ * when a PinPath is given.
+ */
 struct {
 	__uint(type, BPF_MAP_TYPE_LPM_TRIE);
 	__uint(max_entries, STEERING_MAX_ENTRIES);
 	__uint(map_flags, BPF_F_NO_PREALLOC);
+	__uint(pinning, LIBBPF_PIN_BY_NAME);
 	__type(key, struct steering_key);
 	__type(value, struct steering_val);
 } steering SEC(".maps");
@@ -101,6 +108,7 @@ struct {
 struct {
 	__uint(type, BPF_MAP_TYPE_LRU_HASH);
 	__uint(max_entries, FLOW_PEER_MAX_ENTRIES);
+	__uint(pinning, LIBBPF_PIN_BY_NAME);
 	__type(key, struct flow_key);
 	__type(value, __u32);
 } flow_peer SEC(".maps");
@@ -108,6 +116,7 @@ struct {
 struct {
 	__uint(type, BPF_MAP_TYPE_ARRAY);
 	__uint(max_entries, PEER_DEV_MAX_ENTRIES);
+	__uint(pinning, LIBBPF_PIN_BY_NAME);
 	__type(key, __u32);
 	__type(value, __u32);
 } peer_dev SEC(".maps");
@@ -115,6 +124,7 @@ struct {
 struct {
 	__uint(type, BPF_MAP_TYPE_ARRAY);
 	__uint(max_entries, 1);
+	__uint(pinning, LIBBPF_PIN_BY_NAME);
 	__type(key, __u32);
 	__type(value, struct runtime_cfg);
 } runtime_cfg SEC(".maps");

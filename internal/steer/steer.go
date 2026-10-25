@@ -22,10 +22,22 @@ const (
 
 const MaxCandidates = 4
 
+// WireAddr returns an IPv4 address in the u32 representation the
+// BPF programs use. The programs copy iphdr fields verbatim with
+// bpf_skb_load_bytes, so the in-memory bytes of the u32 are the
+// packet bytes in order; map keys are compared as byte strings, so
+// Go must produce a value whose in-memory bytes are also the packet
+// bytes in order. On the little-endian hosts wgmux targets that is
+// binary.LittleEndian — binary.BigEndian here byte-swaps every key
+// and no steering lookup ever hits (found by the containerlab e2e).
+func WireAddr(ip net.IP) uint32 {
+	return binary.LittleEndian.Uint32(ip.To4())
+}
+
 // Entry is one steering map value plus its LPM key.
 type Entry struct {
 	PrefixLen uint32
-	Addr      uint32 // network byte order, as the LPM trie expects
+	Addr      uint32 // wire representation, see WireAddr
 	PeerIDs   [MaxCandidates]uint32
 	Count     uint8
 	Active    uint8
@@ -43,7 +55,7 @@ func BuildEntries(cfg *config.Config) ([]Entry, error) {
 		}
 		ones, _ := ipnet.Mask.Size()
 		e := Entry{PrefixLen: uint32(ones)}
-		e.Addr = binary.BigEndian.Uint32(ipnet.IP.To4())
+		e.Addr = WireAddr(ipnet.IP)
 		for i, name := range p.Candidates {
 			peer := cfg.PeerByName(name)
 			if peer == nil {
@@ -67,7 +79,8 @@ func BuildEntries(cfg *config.Config) ([]Entry, error) {
 }
 
 // FlowKey mirrors struct flow_key in bpf/mux.c. Addresses and ports are in
-// network byte order, exactly as they appear in the packet.
+// the wire representation (see WireAddr): their in-memory bytes are
+// exactly the packet bytes, as bpf_skb_load_bytes leaves them.
 type FlowKey struct {
 	SAddr uint32
 	DAddr uint32

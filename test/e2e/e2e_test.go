@@ -211,6 +211,10 @@ func (l *lab) setupSite(node, name, outer string, priv wgtypes.Key, muxOuter str
 	l.exec(node, fmt.Sprintf("printf '%%s' '%s' > /tmp/priv && wg set wg0 listen-port %d private-key /tmp/priv peer %s allowed-ips %s/32 endpoint %s:%d persistent-keepalive 5",
 		priv.String(), sitePort, muxPub.String(), muxInner, muxOuter, muxPort))
 	l.exec(node, "ip addr add "+innerIP+"/32 dev wg0 && ip link set wg0 up")
+	// Raw `wg set` installs no routes (wg-quick would): without this,
+	// traffic for the mux's tunnel address leaves via the management
+	// default route instead of the tunnel — replies included.
+	l.exec(node, "ip route add "+muxInner+"/32 dev wg0")
 	l.exec(node, "mkdir -p /srv && printf '"+name+"\\n' > /srv/index.html")
 	l.execBg(node, "nohup python3 -m http.server 8080 --bind "+innerIP+" --directory /srv >/var/log/http.log 2>&1 &")
 	// Keep the tunnel to the mux warm so handshakes stay fresh: the

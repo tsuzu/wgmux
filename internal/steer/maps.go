@@ -5,7 +5,7 @@ package steer
 
 type SteeringKey struct {
 	PrefixLen uint32
-	Addr      uint32 // network byte order
+	Addr      uint32 // wire representation, see WireAddr
 }
 
 type SteeringVal struct {
@@ -17,9 +17,9 @@ type SteeringVal struct {
 }
 
 type FlowKeyT struct {
-	SAddr uint32 // network byte order
+	SAddr uint32 // wire representation, see WireAddr
 	DAddr uint32
-	SPort uint16 // network byte order
+	SPort uint16 // wire representation
 	DPort uint16
 	Proto uint8
 	Pad   [3]uint8

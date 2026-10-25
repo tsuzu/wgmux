@@ -1,9 +1,26 @@
 package steer
 
 import (
+	"bytes"
+	"encoding/binary"
 	"testing"
 	"unsafe"
+
+	"github.com/tsuzu/wgmux/internal/config"
 )
+
+func mkConfig(t *testing.T) *config.Config {
+	t.Helper()
+	return &config.Config{
+		Peers: []config.Peer{
+			{Name: "site-a", ID: 1},
+			{Name: "site-b", ID: 2},
+		},
+		Prefixes: []config.Prefix{
+			{CIDR: "10.20.0.10/32", Candidates: []string{"site-a", "site-b"}, Active: "site-a", Policy: "active"},
+		},
+	}
+}
 
 // The BPF side (bpf/mux.c) depends on these exact sizes.
 func TestMapLayoutSizes(t *testing.T) {
@@ -46,5 +63,29 @@ func TestHashPickIsStable(t *testing.T) {
 	}
 	if len(seen) < 2 {
 		t.Errorf("hash does not spread flows across candidates: %v", seen)
+	}
+}
+
+// The steering lookup key the BPF program builds holds the packet's
+// address bytes in order (bpf_skb_load_bytes of the iphdr). The
+// Go-written key must be byte-identical when marshalled the way
+// cilium/ebpf writes structs on this host (native = little-endian):
+// a byte-swapped key silently never matches (the containerlab e2e
+// caught exactly that).
+func TestSteeringKeyWireBytes(t *testing.T) {
+	entries, err := BuildEntries(mkConfig(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 1 {
+		t.Fatalf("want 1 entry, got %d", len(entries))
+	}
+	key := entries[0].MapKey()
+	var buf [8]byte
+	binary.LittleEndian.PutUint32(buf[0:4], key.PrefixLen)
+	binary.LittleEndian.PutUint32(buf[4:8], key.Addr)
+	want := []byte{32, 0, 0, 0, 10, 20, 0, 10}
+	if !bytes.Equal(buf[:], want) {
+		t.Fatalf("steering key bytes = %v, want %v", buf, want)
 	}
 }

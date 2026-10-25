@@ -5,7 +5,6 @@
 package daemon
 
 import (
-	"encoding/binary"
 	"fmt"
 	"net"
 	"sync"
@@ -103,7 +102,7 @@ func entriesFromSpec(spec api.ApplySpec) ([]steer.Entry, error) {
 			return nil, err
 		}
 		ones, _ := ipnet.Mask.Size()
-		e := steer.Entry{PrefixLen: uint32(ones), Addr: binary.BigEndian.Uint32(ipnet.IP.To4())}
+		e := steer.Entry{PrefixLen: uint32(ones), Addr: steer.WireAddr(ipnet.IP)}
 		for i, id := range p.CandidateIDs {
 			if i >= steer.MaxCandidates {
 				return nil, fmt.Errorf("prefix %s: too many candidates", p.CIDR)
@@ -186,7 +185,7 @@ func (d *Daemon) State() (api.State, error) {
 		_, ipnet, err := net.ParseCIDR(p.CIDR)
 		if err == nil {
 			ones, _ := ipnet.Mask.Size()
-			key := steer.SteeringKey{PrefixLen: uint32(ones), Addr: binary.BigEndian.Uint32(ipnet.IP.To4())}
+			key := steer.SteeringKey{PrefixLen: uint32(ones), Addr: steer.WireAddr(ipnet.IP)}
 			if val, ok := snap[key]; ok {
 				if int(val.Active) < len(val.PeerIDs) {
 					ps.ActiveID = val.PeerIDs[val.Active]

@@ -11,7 +11,6 @@ package datapath
 import (
 	"bytes"
 	_ "embed"
-	"encoding/binary"
 	"errors"
 	"fmt"
 	"net"
@@ -197,7 +196,7 @@ func Apply(spec api.ApplySpec, info Info, entries []steer.Entry) error {
 }
 
 func addrBE(ip net.IP) uint32 {
-	return binary.BigEndian.Uint32(ip.To4())
+	return steer.WireAddr(ip)
 }
 
 // loadErr enriches a collection load failure with the tail of the
