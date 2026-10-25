@@ -17,6 +17,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"github.com/cilium/ebpf"
 	"github.com/cilium/ebpf/link"
@@ -110,7 +111,7 @@ func Apply(spec api.ApplySpec, info Info, entries []steer.Entry) error {
 		Maps: ebpf.MapOptions{PinPath: spec.PinDir},
 	})
 	if err != nil {
-		return fmt.Errorf("load from_front collection: %w", err)
+		return loadErr("load from_front collection", err)
 	}
 	defer front.Close()
 
@@ -156,7 +157,7 @@ func Apply(spec api.ApplySpec, info Info, entries []steer.Entry) error {
 			MapReplacements: shared,
 		})
 		if err != nil {
-			return fmt.Errorf("load from_wg collection for peer %d: %w", peerID, err)
+			return loadErr(fmt.Sprintf("load from_wg collection for peer %d", peerID), err)
 		}
 		collections = append(collections, coll)
 		attachments = append(attachments, attachment{
@@ -197,6 +198,20 @@ func Apply(spec api.ApplySpec, info Info, entries []steer.Entry) error {
 
 func addrBE(ip net.IP) uint32 {
 	return binary.BigEndian.Uint32(ip.To4())
+}
+
+// loadErr enriches a collection load failure with the tail of the
+// kernel verifier log, which is where the actual reason lives.
+func loadErr(what string, err error) error {
+	var ve *ebpf.VerifierError
+	if errors.As(err, &ve) && len(ve.Log) > 0 {
+		lines := ve.Log
+		if len(lines) > 120 {
+			lines = lines[len(lines)-120:]
+		}
+		return fmt.Errorf("%s: %w\nverifier log (tail):\n%s", what, err, strings.Join(lines, "\n"))
+	}
+	return fmt.Errorf("%s: %w", what, err)
 }
 
 func legacyAttach(spec *ebpf.CollectionSpec) {

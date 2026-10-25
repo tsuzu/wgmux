@@ -172,6 +172,17 @@ static __always_inline int parse_flow_key(struct __sk_buff *skb,
 }
 
 /*
+ * Note on barrier_var (from bpf_helpers.h): it hides a value's
+ * provenance from clang. It is needed before masking an index into a
+ * map value array (see mux_from_front): clang can prove from the
+ * source-level range checks that the mask is redundant and delete
+ * it, but the kernel verifier cannot reproduce that proof (it does
+ * not narrow a map-loaded u8 through the wrapped subtract-and-
+ * compare sequence clang emits for the checks), so the unmasked
+ * index looks unbounded to the verifier and the load fails.
+ */
+
+/*
  * Simple Jenkins-style mix over the flow key fields.  Used for
  * steering policy 1 to spread flows deterministically over the
  * candidate peers for a prefix (same flow -> same hash -> same peer,
@@ -245,9 +256,12 @@ int mux_from_front(struct __sk_buff *skb)
 		/*
 		 * Mask the index to the array bounds so the verifier
 		 * can prove the peer_id[] access is in range.  The mask
-		 * is a no-op semantically: in both policies above
-		 * idx < count <= MAX_CANDIDATE_PEERS.
+		 * is a no-op semantically (idx < count <= 4 in both
+		 * policies above), but it must survive compilation:
+		 * barrier_var hides idx's provenance so clang cannot
+		 * delete the mask as redundant (see barrier_var).
 		 */
+		barrier_var(idx);
 		idx &= MAX_CANDIDATE_PEERS - 1;
 		peer_id = val->peer_id[idx];
 
