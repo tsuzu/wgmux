@@ -289,8 +289,18 @@ int mux_from_front(struct __sk_buff *skb)
 
 		/* 4. wg devices are L3: drop the interconnect header. */
 		if (l2_mode) {
+			/*
+			 * BPF_ADJ_ROOM_NET, not _MAC: with _MAC the strip
+			 * consumed 28 bytes instead of 14 on the veth
+			 * receive path (the containerlab e2e captured the
+			 * packet at the wg device starting mid-IP-header:
+			 * the MAC-mode adjustment is anchored at the MAC
+			 * header and double-counts the data/mac offset on
+			 * this path). _NET anchors at the network header,
+			 * which is exactly the boundary being removed.
+			 */
 			if (bpf_skb_adjust_room(skb, -(__s32)ETH_HLEN,
-						 BPF_ADJ_ROOM_MAC, 0) < 0)
+						 BPF_ADJ_ROOM_NET, 0) < 0)
 				return TC_ACT_SHOT;
 		}
 
@@ -351,9 +361,12 @@ int mux_from_wg(struct __sk_buff *skb)
 		 * The packet must cross a veth to reach the main
 		 * netns, so it needs an Ethernet header again.
 		 * point-to-point link: fixed MACs, no ARP involved.
+		 * BPF_ADJ_ROOM_NET for the same reason as in
+		 * mux_from_front (a wg receive skb has no meaningful
+		 * MAC header to anchor _MAC at).
 		 */
 		if (bpf_skb_adjust_room(skb, (__s32)ETH_HLEN,
-					 BPF_ADJ_ROOM_MAC, 0) < 0)
+					 BPF_ADJ_ROOM_NET, 0) < 0)
 			return TC_ACT_SHOT;
 
 		if (bpf_skb_store_bytes(skb, 0, &eth, sizeof(eth), 0) < 0)
