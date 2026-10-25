@@ -116,7 +116,7 @@ func Apply(spec api.ApplySpec, info Info, entries []steer.Entry) error {
 	defer front.Close()
 
 	shared := map[string]*ebpf.Map{}
-	for _, name := range []string{MapSteering, MapFlowPeer, MapPeerDev, MapRuntimeCfg} {
+	for _, name := range []string{MapSteering, MapFlowPeer, MapPeerDev, MapRuntimeCfg, MapDebug} {
 		m := front.Maps[name]
 		if m == nil {
 			return fmt.Errorf("BPF object is missing map %q", name)
