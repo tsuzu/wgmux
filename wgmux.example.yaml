@@ -1,0 +1,78 @@
+# wgmux example: one inner IP (10.20.0.10) reachable via two sites whose
+# networks overlap, plus a subnet shared by the same two sites.
+#
+# The main namespace ends up with exactly one new interface (wg-mux).
+# Both WireGuard devices live in the "wgmux" network namespace.
+
+front:
+  name: wg-mux
+  address: 10.200.0.2/24 # this host's tunnel identity
+  backend_address: 10.200.0.1/24
+  mtu: 1420
+
+backend_ns: wgmux
+
+# Data plane / control plane split:
+#   wgmuxd (daemon) owns the kernel state and serves api_socket.
+#   wgmuxctl (this config's owner) only sends it desired state and
+#   selection decisions. Start wgmuxd first, then use wgmuxctl.
+api_socket: /run/wgmux/wgmuxd.sock
+
+# Switchable axes:
+engine: kernel #       kernel (in-tree WireGuard) | userspace (wireguard-go)
+interconnect: veth #   veth | netkit (kernel >= 6.7)
+attach: tcx #          tcx  | tc (legacy clsact)
+# manage_routes: false # let FRR/zebra own the main-namespace routes instead
+
+identity:
+  private_key_file: /etc/wgmux/private.key
+
+peers:
+  - name: site-a
+    listen_port: 51820
+    public_key: "REPLACE_ME_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+    endpoint: 203.0.113.10:51820
+    persistent_keepalive: 25
+  - name: site-b
+    listen_port: 51821
+    public_key: "REPLACE_ME_BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB="
+    endpoint: 203.0.113.11:51820
+    persistent_keepalive: 25
+
+prefixes:
+  # The same host IP exists behind both sites. Manual/failover choice.
+  - cidr: 10.20.0.10/32
+    candidates: [site-a, site-b]
+    active: site-a
+    policy: failover # active | hash | failover
+  # A whole overlapping subnet, spread per flow across both sites.
+  - cidr: 192.168.10.0/24
+    candidates: [site-a, site-b]
+    policy: hash
+  # A prefix whose active peer follows BGP best paths (needs bgp: below).
+  # - cidr: 172.16.0.0/24
+  #   candidates: [site-a, site-b]
+  #   policy: bgp
+
+failover:
+  handshake_max_age_seconds: 150
+  interval_seconds: 15
+
+# BGP as a selection source (policy: bgp prefixes). The BGP neighbor a
+# prefix's best path came from is mapped to a wgmux peer by IP.
+bgp:
+  mode: none # none | gobgp | frr
+  # --- gobgp (embedded in wgmuxctl) ---
+  # local_as: 65001
+  # router_id: 10.200.0.2
+  # listen_port: 179
+  # --- frr (external daemon, polled via vtysh) ---
+  # vtysh_path: vtysh
+  # poll_interval_seconds: 10
+  # neighbors:
+  #   - address: 10.200.0.11 # neighbor reached via site-a's tunnel
+  #     remote_as: 65011 #     (gobgp only)
+  #     wg_peer: site-a
+  #   - address: 10.200.0.12
+  #     remote_as: 65012
+  #     wg_peer: site-b

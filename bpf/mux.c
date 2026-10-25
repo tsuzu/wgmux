@@ -1,0 +1,343 @@
+// SPDX-License-Identifier: GPL-2.0
+/*
+ * wgmux datapath — TC programs for the backend network namespace.
+ *
+ * Per-Peer WireGuard devices live in a hidden backend netns.  A single
+ * interconnect pair (veth, or netkit in L3 mode) links the main netns
+ * (front end) to the backend.  All steering is done here, in TC ingress:
+ * no kernel FIB lookup, no ip_forward and no TTL decrement happen inside
+ * the backend.
+ *
+ *   mux_from_front: TC ingress on the backend end of the interconnect.
+ *                   Parses the inner IPv4 packet, selects a Peer and
+ *                   bpf_redirect()s the packet to that Peer's wg device
+ *                   (egress).
+ *
+ *   mux_from_wg:    TC ingress on each wg device.  Records the flow so
+ *                   that replies return via the same Peer, then
+ *                   bpf_redirect()s the packet out of the interconnect
+ *                   backend end (egress) toward the main netns.
+ *
+ * Wire format / map contract (fixed — the Go loader depends on it):
+ * see NOTES.md in this directory.
+ *
+ * IPv4 only, for now.  Non-IPv4 / unparseable packets are passed with
+ * TC_ACT_OK, never dropped, so that other traffic on these devices is
+ * not broken by the multiplexer.
+ */
+
+#include <stdbool.h>
+#include <linux/bpf.h>
+#include <linux/if_ether.h>
+#include <linux/ip.h>
+#include <linux/in.h>
+#include <linux/pkt_cls.h>
+#include <bpf/bpf_helpers.h>
+#include <bpf/bpf_endian.h>
+
+/* ------------------------------------------------------------------ */
+/* Shared types (must match the Go loader exactly)                     */
+/* ------------------------------------------------------------------ */
+
+#define MAX_CANDIDATE_PEERS 4
+#define STEERING_MAX_ENTRIES 1024
+#define FLOW_PEER_MAX_ENTRIES 65536
+#define PEER_DEV_MAX_ENTRIES 256
+
+struct steering_key {
+	__u32 prefixlen;
+	__u32 addr; /* network byte order */
+};
+
+struct steering_val {
+	__u32 peer_id[MAX_CANDIDATE_PEERS];
+	__u8 count;
+	__u8 active;
+	__u8 policy; /* 0 = peer_id[active], 1 = per-flow hash over peer_id[0..count) */
+	__u8 pad;
+};
+
+struct flow_key {
+	__u32 saddr; /* network byte order */
+	__u32 daddr; /* network byte order */
+	__u16 sport; /* network byte order, as on the wire; 0 if not TCP/UDP */
+	__u16 dport; /* network byte order, as on the wire; 0 if not TCP/UDP */
+	__u8 proto;
+	__u8 pad[3];
+};
+
+struct runtime_cfg {
+	__u32 back_ifindex;
+	__u8 front_mac[6];
+	__u8 back_mac[6];
+};
+
+/* ------------------------------------------------------------------ */
+/* Load-time constants (rewritten per instance by the Go loader)       */
+/* ------------------------------------------------------------------ */
+
+/* true: interconnect is veth (packets there carry an Ethernet header).
+ * false: interconnect is netkit L3 (packets there are raw IP).
+ */
+const volatile bool l2_mode;
+
+/* Only used by mux_from_wg: the peer_id of the wg device this program
+ * instance is attached to.
+ */
+const volatile __u32 own_peer_id;
+
+/* ------------------------------------------------------------------ */
+/* Maps                                                                */
+/* ------------------------------------------------------------------ */
+
+struct {
+	__uint(type, BPF_MAP_TYPE_LPM_TRIE);
+	__uint(max_entries, STEERING_MAX_ENTRIES);
+	__uint(map_flags, BPF_F_NO_PREALLOC);
+	__type(key, struct steering_key);
+	__type(value, struct steering_val);
+} steering SEC(".maps");
+
+struct {
+	__uint(type, BPF_MAP_TYPE_LRU_HASH);
+	__uint(max_entries, FLOW_PEER_MAX_ENTRIES);
+	__type(key, struct flow_key);
+	__type(value, __u32);
+} flow_peer SEC(".maps");
+
+struct {
+	__uint(type, BPF_MAP_TYPE_ARRAY);
+	__uint(max_entries, PEER_DEV_MAX_ENTRIES);
+	__type(key, __u32);
+	__type(value, __u32);
+} peer_dev SEC(".maps");
+
+struct {
+	__uint(type, BPF_MAP_TYPE_ARRAY);
+	__uint(max_entries, 1);
+	__type(key, __u32);
+	__type(value, struct runtime_cfg);
+} runtime_cfg SEC(".maps");
+
+/* ------------------------------------------------------------------ */
+/* Helpers                                                             */
+/* ------------------------------------------------------------------ */
+
+/*
+ * Parse an IPv4 packet starting at @hdr_off and fill @fk in the
+ * forward direction (local -> remote, exactly as seen on the wire).
+ *
+ * Returns 0 on success, -1 if the packet is not IPv4 or cannot be
+ * parsed safely; callers treat -1 as "pass" (TC_ACT_OK).
+ *
+ * Parsing goes through bpf_skb_load_bytes() everywhere, so there is no
+ * direct-packet-access pointer arithmetic for the verifier to track
+ * across the variable-length (IHL) IPv4 header.
+ */
+static __always_inline int parse_flow_key(struct __sk_buff *skb,
+					  __u32 hdr_off,
+					  struct flow_key *fk)
+{
+	struct iphdr iph = {};
+	__u32 ihl;
+
+	if (bpf_skb_load_bytes(skb, hdr_off, &iph, sizeof(iph)) < 0)
+		return -1;
+
+	if (iph.version != 4)
+		return -1;
+
+	/* ihl is in 32-bit words; valid range is 5..15 (20..60 bytes). */
+	if (iph.ihl < sizeof(iph) / 4 || iph.ihl > 15)
+		return -1;
+	ihl = (__u32)iph.ihl * 4;
+
+	__builtin_memset(fk, 0, sizeof(*fk));
+	fk->saddr = iph.saddr;
+	fk->daddr = iph.daddr;
+	fk->proto = iph.protocol;
+	/* sport/dport stay 0 for non-TCP/UDP (e.g. ICMP): see NOTES.md. */
+
+	if (iph.protocol == IPPROTO_TCP || iph.protocol == IPPROTO_UDP) {
+		__u16 ports[2] = {};
+
+		if (bpf_skb_load_bytes(skb, hdr_off + ihl, ports,
+				       sizeof(ports)) < 0)
+			return -1;
+		fk->sport = ports[0];
+		fk->dport = ports[1];
+	}
+
+	return 0;
+}
+
+/*
+ * Simple Jenkins-style mix over the flow key fields.  Used for
+ * steering policy 1 to spread flows deterministically over the
+ * candidate peers for a prefix (same flow -> same hash -> same peer,
+ * at least until the candidate set changes).
+ */
+static __always_inline __u32 flow_hash(const struct flow_key *fk)
+{
+	__u32 h = 0x9e3779b9;
+
+	h ^= fk->saddr;
+	h *= 0x85ebca6b;
+	h ^= h >> 13;
+	h ^= fk->daddr;
+	h *= 0xc2b2ae35;
+	h ^= h >> 16;
+	h ^= ((__u32)fk->sport << 16) | fk->dport;
+	h *= 0x85ebca6b;
+	h ^= h >> 13;
+	h ^= fk->proto;
+	h *= 0xc2b2ae35;
+	h ^= h >> 16;
+	return h;
+}
+
+/* ------------------------------------------------------------------ */
+/* Program A: interconnect (backend end) -> selected wg device         */
+/* ------------------------------------------------------------------ */
+
+SEC("tcx/ingress")
+int mux_from_front(struct __sk_buff *skb)
+{
+	const __u32 hdr_off = l2_mode ? ETH_HLEN : 0;
+	struct flow_key fk;
+	__u32 peer_id;
+	__u32 *ifindex;
+
+	if (parse_flow_key(skb, hdr_off, &fk) < 0)
+		return TC_ACT_OK; /* non-IPv4 / unparseable: pass */
+
+	/* 1. An established flow stays on its peer. */
+	__u32 *pinned = bpf_map_lookup_elem(&flow_peer, &fk);
+
+	if (pinned) {
+		peer_id = *pinned;
+	} else {
+		/* 2. Otherwise steer by the destination address. */
+		struct steering_key skey = {
+			.prefixlen = 32,
+			.addr = fk.daddr,
+		};
+		struct steering_val *val =
+			bpf_map_lookup_elem(&steering, &skey);
+		__u32 idx;
+
+		if (!val)
+			return TC_ACT_OK; /* not a steered destination */
+
+		if (val->count == 0 || val->count > MAX_CANDIDATE_PEERS)
+			return TC_ACT_OK;
+
+		if (val->policy == 0) {
+			if (val->active >= val->count)
+				return TC_ACT_OK;
+			idx = val->active;
+		} else if (val->policy == 1) {
+			idx = flow_hash(&fk) % val->count;
+		} else {
+			return TC_ACT_OK; /* unknown policy */
+		}
+
+		/*
+		 * Mask the index to the array bounds so the verifier
+		 * can prove the peer_id[] access is in range.  The mask
+		 * is a no-op semantically: in both policies above
+		 * idx < count <= MAX_CANDIDATE_PEERS.
+		 */
+		idx &= MAX_CANDIDATE_PEERS - 1;
+		peer_id = val->peer_id[idx];
+
+		bpf_map_update_elem(&flow_peer, &fk, &peer_id, BPF_ANY);
+	}
+
+	/* 3. Resolve the peer to its wg device in the backend netns. */
+	ifindex = bpf_map_lookup_elem(&peer_dev, &peer_id);
+	if (!ifindex || *ifindex == 0)
+		return TC_ACT_SHOT; /* steered peer has no device: drop */
+
+	/* Copy out of the map before touching the packet. */
+	{
+		__u32 target_ifindex = *ifindex;
+
+		/* 4. wg devices are L3: drop the interconnect header. */
+		if (l2_mode) {
+			if (bpf_skb_adjust_room(skb, -(__s32)ETH_HLEN,
+						 BPF_ADJ_ROOM_MAC, 0) < 0)
+				return TC_ACT_SHOT;
+		}
+
+		return bpf_redirect(target_ifindex, 0);
+	}
+}
+
+/* ------------------------------------------------------------------ */
+/* Program B: wg device -> interconnect (backend end) -> main netns    */
+/* ------------------------------------------------------------------ */
+
+SEC("tcx/ingress")
+int mux_from_wg(struct __sk_buff *skb)
+{
+	struct flow_key fk;
+	struct flow_key rev;
+	struct runtime_cfg *cfg;
+	__u32 zero = 0;
+	__u32 back_ifindex;
+	__u32 own = own_peer_id;
+
+	/* wg devices are L3, so the packet is raw IP in both modes. */
+	if (parse_flow_key(skb, 0, &fk) < 0)
+		return TC_ACT_OK; /* non-IPv4 / unparseable: pass */
+
+	/*
+	 * Record the reverse key, i.e. in the same shape a packet of
+	 * the reply flow will have in mux_from_front (local -> remote):
+	 * swap addresses and ports.  A later locally-originated packet
+	 * belonging to this flow then hits in flow_peer and returns
+	 * via this peer even if the steering policy has moved on.
+	 */
+	__builtin_memset(&rev, 0, sizeof(rev));
+	rev.saddr = fk.daddr;
+	rev.daddr = fk.saddr;
+	rev.sport = fk.dport;
+	rev.dport = fk.sport;
+	rev.proto = fk.proto;
+	bpf_map_update_elem(&flow_peer, &rev, &own, BPF_ANY);
+
+	cfg = bpf_map_lookup_elem(&runtime_cfg, &zero);
+	if (!cfg || cfg->back_ifindex == 0)
+		return TC_ACT_SHOT; /* not (yet) configured: drop */
+
+	/* Copy everything out of the map before touching the packet. */
+	back_ifindex = cfg->back_ifindex;
+
+	if (l2_mode) {
+		struct ethhdr eth = {};
+
+		__builtin_memcpy(eth.h_dest, cfg->front_mac,
+				 sizeof(eth.h_dest));
+		__builtin_memcpy(eth.h_source, cfg->back_mac,
+				 sizeof(eth.h_source));
+		eth.h_proto = bpf_htons(ETH_P_IP);
+
+		/*
+		 * The packet must cross a veth to reach the main
+		 * netns, so it needs an Ethernet header again.
+		 * point-to-point link: fixed MACs, no ARP involved.
+		 */
+		if (bpf_skb_adjust_room(skb, (__s32)ETH_HLEN,
+					 BPF_ADJ_ROOM_MAC, 0) < 0)
+			return TC_ACT_SHOT;
+
+		if (bpf_skb_store_bytes(skb, 0, &eth, sizeof(eth), 0) < 0)
+			return TC_ACT_SHOT;
+	}
+	/* netkit L3 mode: no header to add, the packet stays raw IP. */
+
+	return bpf_redirect(back_ifindex, 0);
+}
+
+char _license[] SEC("license") = "GPL";
