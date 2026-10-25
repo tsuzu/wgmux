@@ -8,26 +8,14 @@
  * no kernel FIB lookup, no ip_forward and no TTL decrement happen inside
  * the backend.
  *
- *   mux_strip_l2:   XDP on the backend end of a VETH interconnect.
- *                   Selects the Peer (same maps as mux_from_front)
- *                   and records the flow for steered IPv4 frames,
- *                   then passes.  It does NOT strip the Ethernet
- *                   header itself: on veth, the driver's
- *                   eth_type_trans() pulls the header when an
- *                   XDP_PASS frame is delivered, so by the time the
- *                   packet reaches mux_from_front at TC it is L3.
- *                   (Stripping in XDP too would pull the header
- *                   twice — 28 bytes — as the e2e captures showed.)
- *                   ARP and unsteered frames pass untouched.
- *                   (netkit interconnects are L3 already and do not
- *                   use this program.)
- *
  *   mux_from_front: TC ingress on the backend end of the interconnect.
- *                   The packet is always L3 here (netkit natively, or
- *                   stripped by mux_strip_l2 on veth).  Parses the
- *                   inner IPv4 packet, selects a Peer and
+ *                   Parses the inner IPv4 packet, selects a Peer and
  *                   bpf_redirect()s the packet to that Peer's wg device
- *                   (egress).
+ *                   (egress).  On a veth interconnect the packet still
+ *                   carries its Ethernet header at TC ingress (neither
+ *                   XDP_PASS delivery nor anything else pulls it before
+ *                   TC — verified empirically), so the header is
+ *                   removed in place first (see strip_l2_header).
  *
  *   mux_from_wg:    TC ingress on each wg device.  Records the flow so
  *                   that replies return via the same Peer, then
@@ -299,75 +287,42 @@ static __always_inline int select_peer(const struct flow_key *fk,
 	return 0;
 }
 
-/* XDP twin of parse_flow_key (bpf_xdp_load_bytes instead of _skb_). */
-static __always_inline int parse_flow_key_xdp(struct xdp_md *ctx,
-					      __u32 hdr_off,
-					      struct flow_key *fk)
+/*
+ * Remove the Ethernet header in place (veth mode): shift the L3
+ * packet down over it with load/store_bytes, then trim the tail.
+ * Every helper used here has elementary semantics (copy bytes at
+ * offsets from skb->data; set the length), unlike the header-anchor
+ * arithmetic of bpf_skb_adjust_room — see the file header for why
+ * that helper cannot do this job.  The copy is the veth mode's
+ * cost; netkit mode never pays it.
+ */
+static __always_inline int strip_l2_header(struct __sk_buff *skb)
 {
-	struct iphdr iph = {};
-	__u32 ihl;
+	__u32 total = skb->len;
+	__u32 remain;
+	int i;
 
-	if (bpf_xdp_load_bytes(ctx, hdr_off, &iph, sizeof(iph)) < 0)
+	if (total <= ETH_HLEN || total > ETH_HLEN + 8 * 256)
 		return -1;
+	remain = total - ETH_HLEN;
 
-	if (iph.version != 4)
-		return -1;
+	for (i = 0; i < 8; i++) {
+		__u8 buf[256];
+		__u32 n;
 
-	if (iph.ihl < sizeof(iph) / 4 || iph.ihl > 15)
-		return -1;
-	ihl = (__u32)iph.ihl * 4;
-
-	__builtin_memset(fk, 0, sizeof(*fk));
-	fk->saddr = iph.saddr;
-	fk->daddr = iph.daddr;
-	fk->proto = iph.protocol;
-
-	if (iph.protocol == IPPROTO_TCP || iph.protocol == IPPROTO_UDP) {
-		__u16 ports[2] = {};
-
-		if (bpf_xdp_load_bytes(ctx, hdr_off + ihl, ports,
-				       sizeof(ports)) < 0)
+		if (remain == 0)
+			break;
+		n = remain < 256 ? remain : 256;
+		if (bpf_skb_load_bytes(skb, ETH_HLEN + i * 256, buf, n) < 0)
 			return -1;
-		fk->sport = ports[0];
-		fk->dport = ports[1];
+		if (bpf_skb_store_bytes(skb, i * 256, buf, n, 0) < 0)
+			return -1;
+		remain -= n;
 	}
 
+	if (bpf_skb_change_tail(skb, total - ETH_HLEN, 0) < 0)
+		return -1;
 	return 0;
-}
-
-/* ------------------------------------------------------------------ */
-/* Program S (veth interconnect only): peer selection at XDP; the     */
-/* driver strips the Ethernet header on delivery (see file header).   */
-/* ------------------------------------------------------------------ */
-
-SEC("xdp")
-int mux_strip_l2(struct xdp_md *ctx)
-{
-	struct flow_key fk;
-	__u32 peer_id;
-
-	/* Only framed IPv4 is of interest; everything else (ARP,
-	 * IPv6, ...) passes with its header untouched.
-	 */
-	if (parse_flow_key_xdp(ctx, ETH_HLEN, &fk) < 0)
-		return XDP_PASS;
-
-	/* Only steered destinations are of interest: an unsteered
-	 * packet must reach the backend stack exactly as framed.
-	 */
-	if (select_peer(&fk, &peer_id) < 0)
-		return XDP_PASS;
-
-	/* Deliberately NO bpf_xdp_adjust_head() here: on veth, an
-	 * XDP_PASS frame is handed to eth_type_trans() by the driver,
-	 * which pulls the Ethernet header itself as part of normal
-	 * delivery.  Stripping in XDP as well pulled 14 bytes of the
-	 * IP header too (28 total; verified by the e2e captures).
-	 * The flow record written by select_peer is what
-	 * mux_from_front needs; the header is gone by the time the
-	 * packet reaches TC.
-	 */
-	return XDP_PASS;
 }
 
 /* ------------------------------------------------------------------ */
@@ -377,14 +332,13 @@ int mux_strip_l2(struct xdp_md *ctx)
 SEC("tcx/ingress")
 int mux_from_front(struct __sk_buff *skb)
 {
+	const __u32 hdr_off = l2_mode ? ETH_HLEN : 0;
 	struct flow_key fk;
 	__u32 peer_id;
 	__u32 *ifindex;
+	__u32 target_ifindex;
 
-	/* The packet is L3 here in both interconnect modes (see the
-	 * file header): parse at offset 0.
-	 */
-	if (parse_flow_key(skb, 0, &fk) < 0)
+	if (parse_flow_key(skb, hdr_off, &fk) < 0)
 		return TC_ACT_OK; /* non-IPv4 / unparseable: pass */
 
 	if (select_peer(&fk, &peer_id) < 0)
@@ -394,8 +348,13 @@ int mux_from_front(struct __sk_buff *skb)
 	ifindex = bpf_map_lookup_elem(&peer_dev, &peer_id);
 	if (!ifindex || *ifindex == 0)
 		return TC_ACT_SHOT; /* steered peer has no device: drop */
+	target_ifindex = *ifindex;
 
-	return bpf_redirect(*ifindex, 0);
+	/* wg devices are L3: remove the interconnect Ethernet header. */
+	if (l2_mode && strip_l2_header(skb) < 0)
+		return TC_ACT_SHOT;
+
+	return bpf_redirect(target_ifindex, 0);
 }
 
 /* ------------------------------------------------------------------ */

@@ -55,14 +55,13 @@ per-instance constant (see below).
 ## Per-instance constants (`const volatile`, rewritten by the loader)
 
 - `l2_mode` (`bool`) — `true` when the interconnect is veth: packets
-  at the interconnect carry an Ethernet header. `mux_strip_l2`
-  (XDP on the backend end) performs peer selection for steered
-  IPv4 frames and records the flow; it does not strip anything —
-  on veth, an XDP_PASS frame goes through the driver's
-  `eth_type_trans()`, which pulls the Ethernet header as part of
-  normal delivery (stripping in XDP as well pulled it twice).
-  `mux_from_front` therefore always parses at offset 0, in both
-  modes. In the return direction `mux_from_wg` grows the room back
+  at the interconnect carry an Ethernet header, and it is still
+  there at TC ingress (nothing pulls it earlier on this path).
+  `mux_from_front` parses after `ETH_HLEN` and removes the header
+  in place: the L3 packet is shifted down over it with
+  `bpf_skb_load_bytes`/`bpf_skb_store_bytes` and the tail trimmed
+  with `bpf_skb_change_tail` (`strip_l2_header`). In the return
+  direction `mux_from_wg` grows the room back
   with `bpf_skb_adjust_room(skb, +ETH_HLEN, BPF_ADJ_ROOM_MAC, 0)`
   and writes an Ethernet header (`dst = front_mac`,
   `src = back_mac`, `ethertype = ETH_P_IP`). `false` for netkit L3:

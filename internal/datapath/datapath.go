@@ -41,7 +41,6 @@ var muxObj []byte
 const (
 	ProgFromFront = "mux_from_front"
 	ProgFromWG    = "mux_from_wg"
-	ProgStripL2   = "mux_strip_l2"
 
 	MapSteering   = "steering"
 	MapFlowPeer   = "flow_peer"
@@ -167,32 +166,6 @@ func Apply(spec api.ApplySpec, info Info, entries []steer.Entry) error {
 
 	// --- attach inside the backend namespace.
 	return netnsutil.WithNetNS(spec.BackendNS, func() error {
-		// Veth interconnect: strip the Ethernet header at XDP
-		// (the earliest receive point, where data contractually
-		// starts at it) so the TC program below always sees L3.
-		if l2 {
-			prog := front.Programs[ProgStripL2]
-			if prog == nil {
-				return fmt.Errorf("BPF object is missing program %s", ProgStripL2)
-			}
-			opts := link.XDPOptions{
-				Interface: info.BackIfindex,
-				Program:   prog,
-				Flags:     link.XDPDriverMode,
-			}
-			l, err := link.AttachXDP(opts)
-			if err != nil {
-				opts.Flags = link.XDPGenericMode
-				l, err = link.AttachXDP(opts)
-				if err != nil {
-					return fmt.Errorf("attach xdp %s to ifindex %d: %w", ProgStripL2, info.BackIfindex, err)
-				}
-			}
-			if err := l.Pin(filepath.Join(linksDir, ProgStripL2)); err != nil {
-				l.Close()
-				return fmt.Errorf("pin link %s: %w", ProgStripL2, err)
-			}
-		}
 		for _, att := range attachments {
 			if att.prog == nil {
 				return fmt.Errorf("BPF object is missing a program for %s", att.name)
