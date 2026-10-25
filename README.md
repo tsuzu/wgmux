@@ -1,5 +1,7 @@
 # wgmux — WireGuard multiplexer with an eBPF steering datapath
 
+[![CI](https://github.com/tsuzu/wgmux/actions/workflows/ci.yml/badge.svg)](https://github.com/tsuzu/wgmux/actions/workflows/ci.yml)
+
 WireGuard's AllowedIPs is a one-to-one map: within one device, a prefix
 belongs to exactly one peer (it is both the routing table and the
 source-address ACL — "cryptokey routing"). **wgmux makes the same
@@ -135,7 +137,22 @@ internal/config           YAML config & validation
 
 Verified so far: configuration validation and steering/hash logic
 (unit tests), the FRR/GoBGP decision extraction (unit tests), and the
-BPF object compiles. End-to-end datapath verification (namespace
-plumbing plus real tunnels between two hosts) is the next step; the
-verifier half can be run on any suitable host with
-`WGMUX_TEST_LOAD=1 go test ./internal/datapath/`.
+BPF object compiles. The verifier half can be run on any suitable
+host with `WGMUX_TEST_LOAD=1 go test ./internal/datapath/`.
+
+## End-to-end tests
+
+`test/e2e/` runs the real thing on a containerlab topology: a mux
+node plus **two sites that both own the same inner IP
+(10.20.0.10)**. The Go test (build tag `e2e`) deploys the lab,
+applies a failover configuration, and asserts actual HTTP traffic —
+it lands on the active site, follows `wgmuxctl activate` to the
+other site, and fails over when the active site's tunnel dies:
+
+```sh
+make e2e   # needs docker + containerlab on the host
+# knobs: WGMUX_E2E_ENGINE=kernel|userspace
+#        WGMUX_E2E_INTERCONNECT=veth|netkit  WGMUX_E2E_ATTACH=tcx|tc
+```
+
+CI runs the unit suite plus this e2e matrix on every push.
