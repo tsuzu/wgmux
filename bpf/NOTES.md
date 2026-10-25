@@ -64,21 +64,27 @@ per-instance constant (see below).
   (`__bpf_redirect_no_mac`, net/core/filter.c) — the packet must
   arrive in the standard received state, data at the MAC header.
   Any in-program strip removes the header twice. In the return
-  direction `mux_from_wg` grows the room back
-  with `bpf_skb_adjust_room(skb, +ETH_HLEN, BPF_ADJ_ROOM_MAC, 0)`
-  and writes an Ethernet header (`dst = front_mac`,
-  `src = back_mac`, `ethertype = ETH_P_IP`). `false` for netkit L3:
-  packets are raw IP at the interconnect in both directions and no
-  header conversion happens.
-  (`bpf_skb_adjust_room` cannot do the strip: per
+  direction, `mux_from_wg` (veth mode) records the flow and
+  returns `TC_ACT_OK`: the backend stack forwards the packet out
+  of the interconnect and builds the Ethernet header itself
+  (topology enables `ip_forward` and disables `rp_filter` in the
+  backend namespace for this). A TC-side grow+redirect cannot
+  work here: a wg receive skb has no usable MAC header state,
+  `bpf_skb_net_hdr_push` shifts `mac_header` and
+  `network_header` together so their relation never changes, and
+  `__bpf_redirect_common` drops packets with
+  `mac_header >= network_header` — there is no TC helper that
+  sets `mac_header` below `network_header` from scratch.
+  `false` for netkit L3: packets are raw IP at the interconnect
+  in both directions, `mux_from_wg` redirects, and no header
+  conversion or stack hop happens.
+  (`bpf_skb_adjust_room` cannot do the forward strip either: per
   net/core/filter.c's `bpf_skb_net_hdr_pop`, a shrink deletes
-  `len_diff` bytes at offset `mac_header_len` [+ L3 base length for
-  `BPF_ADJ_ROOM_NET`] from `skb->data` and then pulls `len_diff`
-  bytes — a tunnel-decap primitive that preserves the outer
-  headers. With a MAC header present, no mode's deletion window
-  starts at offset 0. The grow direction is the designed encap
-  case and works because a wg receive skb has `mac_header_len`
-  == 0, putting the insertion at offset 0.)
+  `len_diff` bytes at offset `mac_header_len` [+ L3 base length
+  for `BPF_ADJ_ROOM_NET`] from `skb->data` and then pulls
+  `len_diff` bytes — a tunnel-decap primitive that preserves the
+  outer headers. With a MAC header present, no mode's deletion
+  window starts at offset 0.)
 - `own_peer_id` (`__u32`) — only used by `mux_from_wg`: the peer_id of
   the wg device that instance is attached to; recorded into
   `flow_peer` for the flows arriving from that Peer.

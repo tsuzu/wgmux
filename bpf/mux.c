@@ -32,8 +32,9 @@
  * With a 14-byte MAC header present there is no mode whose deletion
  * window starts at offset 0, so it cannot remove the outermost
  * Ethernet header; the e2e captures showed it eating IP/TCP header
- * bytes instead (see git history).  Its GROW direction is, however,
- * exactly the encap operation mux_from_wg needs.
+ * bytes instead (see git history).  Its GROW direction cannot
+ * fabricate a MAC header on a wg receive skb either — see the
+ * comment in mux_from_wg.
  *
  * Wire format / map contract (fixed — the Go loader depends on it):
  * see NOTES.md in this directory.
@@ -413,6 +414,32 @@ int mux_from_wg(struct __sk_buff *skb)
 	rev.proto = fk.proto;
 	bpf_map_update_elem(&flow_peer, &rev, &own, BPF_ANY);
 
+	if (l2_mode) {
+		/*
+		 * Veth mode: hand the packet to the backend stack
+		 * (TC_ACT_OK) and let it forward the packet out of
+		 * the interconnect; the kernel builds the Ethernet
+		 * header (the backend ARPs for the front address like
+		 * for any connected route).
+		 *
+		 * Why not grow a header and bpf_redirect like the
+		 * forward direction does in reverse?  A wg receive skb
+		 * has no usable MAC header state (mac_header unset or
+		 * equal to network_header), bpf_skb_adjust_room's push
+		 * shifts mac_header and network_header together, and
+		 * no TC helper can set mac_header below network_header
+		 * from scratch — while __bpf_redirect_common drops any
+		 * packet with mac_header >= network_header.  Verified
+		 * empirically: grows and stores all succeeded, the
+		 * redirect was called, and the packet died in the core
+		 * every time.  The cost of this design is one stack
+		 * forwarding pass (and a TTL decrement) on the return
+		 * path in veth mode only; netkit mode redirects in
+		 * both directions and never touches the stack.
+		 */
+		return TC_ACT_OK;
+	}
+
 	cfg = bpf_map_lookup_elem(&runtime_cfg, &zero);
 	if (!cfg || cfg->back_ifindex == 0) {
 		dbg_inc(DBG_WG_CFG_FAIL);
@@ -422,41 +449,7 @@ int mux_from_wg(struct __sk_buff *skb)
 	/* Copy everything out of the map before touching the packet. */
 	back_ifindex = cfg->back_ifindex;
 
-	if (l2_mode) {
-		struct ethhdr eth = {};
-
-		__builtin_memcpy(eth.h_dest, cfg->front_mac,
-				 sizeof(eth.h_dest));
-		__builtin_memcpy(eth.h_source, cfg->back_mac,
-				 sizeof(eth.h_source));
-		eth.h_proto = bpf_htons(ETH_P_IP);
-
-		/*
-		 * The packet must cross a veth to reach the main
-		 * netns, so it needs an Ethernet header again.
-		 * point-to-point link: fixed MACs, no ARP involved.
-		 *
-		 * GROW with BPF_ADJ_ROOM_MAC is the helper's designed
-		 * encap case (see the file header): a wg receive skb
-		 * has no MAC header (mac_header_len == 0), so the room
-		 * is inserted at offset 0, in front of the IP header,
-		 * and the data pointer ends up at the inserted room,
-		 * ready for the store_bytes below.
-		 */
-		if (bpf_skb_adjust_room(skb, (__s32)ETH_HLEN,
-					 BPF_ADJ_ROOM_MAC,
-					 BPF_F_ADJ_ROOM_ENCAP_L2_ETH) < 0) {
-			dbg_inc(DBG_WG_GROW_FAIL);
-			return TC_ACT_SHOT;
-		}
-
-		if (bpf_skb_store_bytes(skb, 0, &eth, sizeof(eth), 0) < 0) {
-			dbg_inc(DBG_WG_STORE_FAIL);
-			return TC_ACT_SHOT;
-		}
-	}
 	/* netkit L3 mode: no header to add, the packet stays raw IP. */
-
 	dbg_inc(DBG_WG_REDIRECTS);
 	return bpf_redirect(back_ifindex, 0);
 }

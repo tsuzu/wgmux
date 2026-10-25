@@ -11,6 +11,7 @@ package topology
 import (
 	"fmt"
 	"net"
+	"os"
 
 	"github.com/vishvananda/netlink"
 	"github.com/vishvananda/netns"
@@ -52,6 +53,31 @@ func Open(spec api.ApplySpec) (*Topology, error) {
 	}
 	if lo, err := backend.LinkByName("lo"); err == nil {
 		backend.LinkSetUp(lo)
+	}
+	if spec.Interconnect == config.InterconnectVeth {
+		// Veth mode only: packets returning from a Peer's wg
+		// device take one stack hop through the backend (see
+		// mux_from_wg in bpf/mux.c for why the redirect cannot
+		// be used in this direction). That needs forwarding on
+		// and rp_filter off (return sources are the steered
+		// prefixes, which the backend has no routes for).
+		err := netnsutil.WithNetNS(spec.BackendNS, func() error {
+			for path, val := range map[string]string{
+				"/proc/sys/net/ipv4/ip_forward":          "1",
+				"/proc/sys/net/ipv4/conf/all/rp_filter": "0",
+				"/proc/sys/net/ipv4/conf/default/rp_filter": "0",
+			} {
+				if err := os.WriteFile(path, []byte(val), 0o644); err != nil {
+					return fmt.Errorf("backend sysctl %s: %w", path, err)
+				}
+			}
+			return nil
+		})
+		if err != nil {
+			nsH.Close()
+			main.Close()
+			return nil, err
+		}
 	}
 	return &Topology{spec: spec, Main: main, Backend: backend, nsH: nsH}, nil
 }
