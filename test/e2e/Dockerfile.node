@@ -4,7 +4,7 @@ FROM ubuntu:24.04
 RUN apt-get update \
  && apt-get install -y --no-install-recommends \
       iproute2 wireguard-tools curl python3 iputils-ping procps \
-      tcpdump bpftool \
+      tcpdump \
  && rm -rf /var/lib/apt/lists/*
 COPY bin/wgmuxd bin/wgmuxctl /usr/local/bin/
 CMD ["sleep", "infinity"]

@@ -318,10 +318,10 @@ func (l *lab) diagnostics() {
 		"ip route; echo; ip neigh; echo; ip -s link show wg-mux; echo; wgmuxctl status -c /etc/wgmux/wgmux.yaml 2>&1")
 	l.diagExec(muxNode, "backend state",
 		"ip netns exec wgmux ip addr; echo; ip netns exec wgmux ip -s link; echo; ip netns exec wgmux wg show all")
-	l.diagExec(muxNode, "bpf attach+maps",
-		"bpftool net show 2>&1; echo; ip netns exec wgmux bpftool net show 2>&1; echo; "+
-			"ls /sys/fs/bpf/wgmux/ 2>&1; for m in steering flow_peer peer_dev runtime_cfg; do "+
-			"echo \"== $m\"; bpftool map dump pinned /sys/fs/bpf/wgmux/$m 2>&1 | head -20; done")
+	l.diagExec(muxNode, "bpf pins",
+		"ls -la /sys/fs/bpf/wgmux/ /sys/fs/bpf/wgmux/links/ 2>&1; echo; "+
+			"tc filter show dev mux-b ingress 2>&1 | head -3; "+
+			"ip netns exec wgmux tc filter show dev mux-b ingress 2>&1 | head -3")
 	l.diagExec(siteANode, "site-a server+wg",
 		"ss -tlnp 2>/dev/null | head; echo; cat /var/log/http.log 2>&1 | head -5; echo; "+
 			"curl -s --max-time 3 http://"+innerIP+":8080/ ; echo; wg show all")
