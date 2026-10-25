@@ -135,10 +135,13 @@ internal/config           YAML config & validation
   limitations (flow pinning is LRU best-effort, ICMP pins per
   host-pair, MTU is the minimum across peers).
 
-Verified so far: configuration validation and steering/hash logic
-(unit tests), the FRR/GoBGP decision extraction (unit tests), and the
-BPF object compiles. The verifier half can be run on any suitable
-host with `WGMUX_TEST_LOAD=1 go test ./internal/datapath/`.
+Verified: configuration validation and steering/hash logic (unit
+tests), the FRR/GoBGP decision extraction (unit tests), and — in CI,
+on every push — the full end-to-end matrix below: real WireGuard
+tunnels carrying real traffic to two sites that share one inner IP,
+including activation flips and automatic failover. The verifier half
+can additionally be run on any suitable host with
+`WGMUX_TEST_LOAD=1 go test ./internal/datapath/`.
 
 ## End-to-end tests
 
@@ -155,4 +158,15 @@ make e2e   # needs docker + containerlab on the host
 #        WGMUX_E2E_INTERCONNECT=veth|netkit  WGMUX_E2E_ATTACH=tcx|tc
 ```
 
-CI runs the unit suite plus this e2e matrix on every push.
+CI runs the unit suite plus this e2e matrix on every push:
+{engine=kernel, interconnect=veth}, {engine=userspace (wireguard-go),
+interconnect=veth} and {engine=kernel, interconnect=netkit} — all
+green. (userspace+netkit is not in the matrix yet.)
+
+One datapath asymmetry worth knowing: in veth mode the return path
+(site → client) takes one forwarding pass through the backend
+namespace's stack (a TC program cannot fabricate the MAC-header
+state a redirect to an Ethernet device requires on a WireGuard
+receive skb — see `bpf/NOTES.md`). The forward path is pure eBPF in
+both modes, and netkit mode is pure eBPF in both directions
+(`bpf_redirect_peer`).

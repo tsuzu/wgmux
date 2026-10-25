@@ -12,7 +12,7 @@ interface (exactly as with a plain single `wg0`).
 | Program | Attach point | Direction handled |
 |---|---|---|
 | `mux_from_front` | TCX ingress on the backend end of the interconnect (veth peer / netkit peer in the backend netns) | local → remote: select a Peer, redirect to its wg device (egress) |
-| `mux_from_wg` | TCX ingress on each per-Peer wg device in the backend netns; one program instance per device | remote → local: record flow, redirect out of the backend interconnect end (egress) toward the main netns |
+| `mux_from_wg` | TCX ingress on each per-Peer wg device in the backend netns; one program instance per device | remote → local: record flow, then hand the packet toward the main netns — veth: pass to the backend stack (`TC_ACT_OK`), which forwards it out of the interconnect; netkit: `bpf_redirect_peer` to the front device |
 
 `mux_from_wg` is loaded once per wg device because `own_peer_id` is a
 per-instance constant (see below).
