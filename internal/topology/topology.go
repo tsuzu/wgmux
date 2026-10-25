@@ -117,11 +117,15 @@ func (t *Topology) BuildInterconnect() (*datapath.Info, error) {
 			return nil, err
 		}
 	}
-	if _, ipnet, err := net.ParseCIDR(spec.FrontAddress); err == nil {
-		t.Main.AddrAdd(front, &netlink.Addr{IPNet: ipnet})
+	// NB: netlink.ParseAddr, not net.ParseCIDR's second return value:
+	// the IPNet from ParseCIDR carries the masked network address
+	// (10.200.0.0), which would assign the network address itself to
+	// the interface instead of the host address (10.200.0.2).
+	if addr, err := netlink.ParseAddr(spec.FrontAddress); err == nil {
+		t.Main.AddrAdd(front, addr)
 	}
-	if _, ipnet, err := net.ParseCIDR(spec.BackendAddress); err == nil {
-		t.Backend.AddrAdd(back, &netlink.Addr{IPNet: ipnet})
+	if addr, err := netlink.ParseAddr(spec.BackendAddress); err == nil {
+		t.Backend.AddrAdd(back, addr)
 	}
 	if err := t.Main.LinkSetUp(front); err != nil {
 		return nil, fmt.Errorf("up front: %w", err)
