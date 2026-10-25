@@ -330,20 +330,23 @@ func (l *lab) diagnostics() {
 		"ss -tlnp 2>/dev/null | head; echo; cat /var/log/http.log 2>&1 | head -5; echo; "+
 			"curl -s --max-time 3 http://"+innerIP+":8080/ ; echo; wg show all")
 
-	// Live probe with captures on every hop.
+	// Live probe with captures on every hop. Hex dumps included:
+	// the exact first bytes at the wg device decide between the
+	// remaining hypotheses (header strip mis-fire vs parse offset).
 	caps := []struct{ node, name, cmd string }{
-		{muxNode, "front", "timeout 9 tcpdump -ni wg-mux -c 20"},
-		{muxNode, "back", "timeout 9 ip netns exec wgmux tcpdump -ni mux-b -c 20"},
-		{muxNode, "wga", "timeout 9 ip netns exec wgmux tcpdump -ni wg-site-a -c 20"},
+		{muxNode, "front", "timeout 9 tcpdump -ni wg-mux -c 20 -xx"},
+		{muxNode, "back", "timeout 9 ip netns exec wgmux tcpdump -ni mux-b -c 20 -xx"},
+		{muxNode, "wga", "timeout 9 ip netns exec wgmux tcpdump -ni wg-site-a -c 20 -xx"},
 		{muxNode, "eth1", "timeout 9 tcpdump -ni eth1 -c 20"},
-		{siteANode, "wg0", "timeout 9 tcpdump -ni wg0 -c 20"},
+		{siteANode, "wg0", "timeout 9 tcpdump -ni wg0 -c 20 -xx"},
 		{siteANode, "eth1", "timeout 9 tcpdump -ni eth1 -c 20"},
 	}
 	for _, c := range caps {
 		l.execBg(c.node, "nohup sh -c '"+c.cmd+" >/tmp/cap-"+c.name+".log 2>&1' >/dev/null 2>&1 &")
 	}
 	time.Sleep(time.Second)
-	l.diagExec(muxNode, "probe ping", "ping -c2 -W2 "+innerIP+" 2>&1")
+	l.diagExec(muxNode, "probe ping gateway (no steering)", "ping -c2 -W2 10.200.0.1 2>&1")
+	l.diagExec(muxNode, "probe ping inner", "ping -c2 -W2 "+innerIP+" 2>&1")
 	l.diagExec(muxNode, "probe curl", "curl -v --max-time 4 "+markerURL+" 2>&1 | head -20")
 	time.Sleep(9 * time.Second)
 	for _, c := range caps {
