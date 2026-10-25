@@ -18,6 +18,11 @@ build-committed:
 test:
 	$(GO) test ./...
 
+# End-to-end tests on a containerlab topology (needs docker +
+# containerlab on the host; see test/e2e/).
+e2e:
+	$(GO) test -tags e2e ./test/e2e/ -v -timeout 40m
+
 vet:
 	$(GO) vet ./...
 

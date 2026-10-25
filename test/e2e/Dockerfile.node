@@ -1,0 +1,9 @@
+# One image for every lab node. The mux node uses the wgmux binaries;
+# the site nodes only need wireguard-tools and a tiny HTTP server.
+FROM ubuntu:24.04
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends \
+      iproute2 wireguard-tools curl python3 iputils-ping procps \
+ && rm -rf /var/lib/apt/lists/*
+COPY bin/wgmuxd bin/wgmuxctl /usr/local/bin/
+CMD ["sleep", "infinity"]

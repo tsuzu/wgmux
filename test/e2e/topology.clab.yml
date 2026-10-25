@@ -1,0 +1,37 @@
+# wgmux end-to-end lab.
+#
+#   mux        the host under test: runs wgmuxd + wgmuxctl, originates
+#              traffic to the duplicated inner IP 10.20.0.10
+#   sitea      a "site" whose host owns 10.20.0.10 (WireGuard endpoint)
+#   siteb      another site that ALSO owns 10.20.0.10 — the overlap is
+#              the whole point of wgmux
+#
+# Outer (ciphertext) addressing:
+#   mux eth1 198.51.100.1/24 <-> sitea eth1 198.51.100.2/24
+#   mux eth2 198.51.101.1/24 <-> siteb eth1 198.51.101.2/24
+#
+# Nodes run privileged (containerlab default) so the mux node can
+# create namespaces, WireGuard devices and BPF programs, and the site
+# nodes can create their WireGuard devices.
+name: wgmux-e2e
+
+topology:
+  nodes:
+    mux:
+      kind: linux
+      image: ${WGMUX_NODE_IMAGE:-wgmux-node:e2e}
+      devices:
+        - /dev/net/tun
+    sitea:
+      kind: linux
+      image: ${WGMUX_NODE_IMAGE:-wgmux-node:e2e}
+      devices:
+        - /dev/net/tun
+    siteb:
+      kind: linux
+      image: ${WGMUX_NODE_IMAGE:-wgmux-node:e2e}
+      devices:
+        - /dev/net/tun
+  links:
+    - endpoints: ["mux:eth1", "sitea:eth1"]
+    - endpoints: ["mux:eth2", "siteb:eth1"]
