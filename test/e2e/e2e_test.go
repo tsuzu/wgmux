@@ -147,7 +147,7 @@ func TestE2E(t *testing.T) {
 	l.setupMux()
 
 	// Both tunnels up; traffic lands on the active site (site-a).
-	l.waitMarker("site-a", 120*time.Second)
+	l.waitMarkerDiag("site-a", 120*time.Second)
 
 	// Manual activation flips new flows to site-b and back.
 	l.markerViaCtl("site-b")
@@ -288,6 +288,64 @@ failover:
 func (l *lab) marker() (string, error) {
 	out, err := l.execOK(muxNode, "curl -s --max-time 5 "+markerURL)
 	return strings.TrimSpace(out), err
+}
+
+// waitMarkerDiag is waitMarker plus, on timeout, a full datapath
+// diagnostic dump (state + packet captures during a live probe) so a
+// CI failure shows exactly which hop drops the traffic.
+func (l *lab) waitMarkerDiag(want string, timeout time.Duration) {
+	l.t.Helper()
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		got, err := l.marker()
+		if err == nil && got == want {
+			return
+		}
+		time.Sleep(3 * time.Second)
+	}
+	l.diagnostics()
+	l.t.Fatalf("timed out waiting for marker == %s (diagnostics above)", want)
+}
+
+func (l *lab) diagExec(node, label, cmd string) {
+	out, err := l.execOK(node, cmd)
+	l.t.Logf("--- diag %s (%s): err=%v\n%s", node, label, err, out)
+}
+
+func (l *lab) diagnostics() {
+	l.t.Helper()
+	l.diagExec(muxNode, "routes+neigh+front stats",
+		"ip route; echo; ip neigh; echo; ip -s link show wg-mux; echo; wgmuxctl status -c /etc/wgmux/wgmux.yaml 2>&1")
+	l.diagExec(muxNode, "backend state",
+		"ip netns exec wgmux ip addr; echo; ip netns exec wgmux ip -s link; echo; ip netns exec wgmux wg show all")
+	l.diagExec(muxNode, "bpf attach+maps",
+		"bpftool net show 2>&1; echo; ip netns exec wgmux bpftool net show 2>&1; echo; "+
+			"ls /sys/fs/bpf/wgmux/ 2>&1; for m in steering flow_peer peer_dev runtime_cfg; do "+
+			"echo \"== $m\"; bpftool map dump pinned /sys/fs/bpf/wgmux/$m 2>&1 | head -20; done")
+	l.diagExec(siteANode, "site-a server+wg",
+		"ss -tlnp 2>/dev/null | head; echo; cat /var/log/http.log 2>&1 | head -5; echo; "+
+			"curl -s --max-time 3 http://"+innerIP+":8080/ ; echo; wg show all")
+
+	// Live probe with captures on every hop.
+	caps := []struct{ node, name, cmd string }{
+		{muxNode, "front", "timeout 9 tcpdump -ni wg-mux -c 20"},
+		{muxNode, "back", "timeout 9 ip netns exec wgmux tcpdump -ni mux-b -c 20"},
+		{muxNode, "wga", "timeout 9 ip netns exec wgmux tcpdump -ni wg-site-a -c 20"},
+		{muxNode, "eth1", "timeout 9 tcpdump -ni eth1 -c 20"},
+		{siteANode, "wg0", "timeout 9 tcpdump -ni wg0 -c 20"},
+		{siteANode, "eth1", "timeout 9 tcpdump -ni eth1 -c 20"},
+	}
+	for _, c := range caps {
+		l.execBg(c.node, "nohup sh -c '"+c.cmd+" >/tmp/cap-"+c.name+".log 2>&1' >/dev/null 2>&1 &")
+	}
+	time.Sleep(time.Second)
+	l.diagExec(muxNode, "probe ping", "ping -c2 -W2 "+innerIP+" 2>&1")
+	l.diagExec(muxNode, "probe curl", "curl -v --max-time 4 "+markerURL+" 2>&1 | head -20")
+	time.Sleep(9 * time.Second)
+	for _, c := range caps {
+		l.diagExec(c.node, "capture "+c.name, "cat /tmp/cap-"+c.name+".log")
+	}
+	l.diagExec(muxNode, "backend wg after probe", "ip netns exec wgmux wg show all")
 }
 
 func (l *lab) waitMarker(want string, timeout time.Duration) {
