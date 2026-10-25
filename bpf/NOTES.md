@@ -57,10 +57,13 @@ per-instance constant (see below).
 - `l2_mode` (`bool`) — `true` when the interconnect is veth: packets
   at the interconnect carry an Ethernet header, and it is still
   there at TC ingress (nothing pulls it earlier on this path).
-  `mux_from_front` parses after `ETH_HLEN` and removes the header
-  in place: the L3 packet is shifted down over it with
-  `bpf_skb_load_bytes`/`bpf_skb_store_bytes` and the tail trimmed
-  with `bpf_skb_change_tail` (`strip_l2_header`). In the return
+  `mux_from_front` parses after `ETH_HLEN` and does NOT remove
+  the header: `bpf_redirect` to a WireGuard device (not a
+  MAC-header-xmit device) makes the redirect core pull
+  `skb_network_offset(skb)` bytes itself
+  (`__bpf_redirect_no_mac`, net/core/filter.c) — the packet must
+  arrive in the standard received state, data at the MAC header.
+  Any in-program strip removes the header twice. In the return
   direction `mux_from_wg` grows the room back
   with `bpf_skb_adjust_room(skb, +ETH_HLEN, BPF_ADJ_ROOM_MAC, 0)`
   and writes an Ethernet header (`dst = front_mac`,

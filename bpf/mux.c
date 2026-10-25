@@ -12,10 +12,12 @@
  *                   Parses the inner IPv4 packet, selects a Peer and
  *                   bpf_redirect()s the packet to that Peer's wg device
  *                   (egress).  On a veth interconnect the packet still
- *                   carries its Ethernet header at TC ingress (neither
- *                   XDP_PASS delivery nor anything else pulls it before
- *                   TC — verified empirically), so the header is
- *                   removed in place first (see strip_l2_header).
+ *                   carries its Ethernet header at TC ingress, and the
+ *                   program deliberately does NOT remove it:
+ *                   bpf_redirect to a non-MAC-xmit device (WireGuard)
+ *                   pulls skb_network_offset bytes in the redirect
+ *                   core itself (__bpf_redirect_no_mac).  See the
+ *                   comment at the redirect in mux_from_front.
  *
  *   mux_from_wg:    TC ingress on each wg device.  Records the flow so
  *                   that replies return via the same Peer, then
@@ -157,12 +159,12 @@ struct {
 } debug SEC(".maps");
 
 #define DBG_FRONT_ENTRIES 0  /* mux_from_front invocations */
-#define DBG_FRAMED 1	     /* of those, detected as Ethernet-framed */
-#define DBG_STRIP_CALLS 2    /* strip_l2_header invocations */
+#define DBG_FRAMED 1	     /* of those, on an L2 (veth) interconnect */
+#define DBG_STRIP_CALLS 2    /* unused (kept for index stability) */
 #define DBG_LAST_LEN 3	     /* skb->len at entry */
 #define DBG_LAST_WORD0 4     /* first 4 bytes at entry */
-#define DBG_AFTER_LEN 5	     /* skb->len after strip */
-#define DBG_AFTER_WORD0 6    /* first 4 bytes after strip */
+#define DBG_AFTER_LEN 5	     /* unused (kept for index stability) */
+#define DBG_AFTER_WORD0 6    /* unused (kept for index stability) */
 #define DBG_REDIRECTS 7	     /* bpf_redirect calls from mux_from_front */
 
 static __always_inline void dbg_set(__u32 idx, __u64 val)
@@ -324,44 +326,6 @@ static __always_inline int select_peer(const struct flow_key *fk,
 	return 0;
 }
 
-/*
- * Remove the Ethernet header in place (veth mode): shift the L3
- * packet down over it with load/store_bytes, then trim the tail.
- * Every helper used here has elementary semantics (copy bytes at
- * offsets from skb->data; set the length), unlike the header-anchor
- * arithmetic of bpf_skb_adjust_room — see the file header for why
- * that helper cannot do this job.  The copy is the veth mode's
- * cost; netkit mode never pays it.
- */
-static __always_inline int strip_l2_header(struct __sk_buff *skb)
-{
-	__u32 total = skb->len;
-	__u32 remain;
-	int i;
-
-	if (total <= ETH_HLEN || total > ETH_HLEN + 8 * 256)
-		return -1;
-	remain = total - ETH_HLEN;
-
-	for (i = 0; i < 8; i++) {
-		__u8 buf[256];
-		__u32 n;
-
-		if (remain == 0)
-			break;
-		n = remain < 256 ? remain : 256;
-		if (bpf_skb_load_bytes(skb, ETH_HLEN + i * 256, buf, n) < 0)
-			return -1;
-		if (bpf_skb_store_bytes(skb, i * 256, buf, n, 0) < 0)
-			return -1;
-		remain -= n;
-	}
-
-	if (bpf_skb_change_tail(skb, total - ETH_HLEN, 0) < 0)
-		return -1;
-	return 0;
-}
-
 /* ------------------------------------------------------------------ */
 /* Program A: interconnect (backend end) -> selected wg device         */
 /* ------------------------------------------------------------------ */
@@ -369,39 +333,18 @@ static __always_inline int strip_l2_header(struct __sk_buff *skb)
 SEC("tcx/ingress")
 int mux_from_front(struct __sk_buff *skb)
 {
+	const __u32 hdr_off = l2_mode ? ETH_HLEN : 0;
 	struct flow_key fk;
 	__u32 peer_id;
 	__u32 *ifindex;
-	__u32 target_ifindex;
-	__u32 hdr_off = 0;
-	bool framed = false;
 	__u32 word0 = 0;
 
 	dbg_inc(DBG_FRONT_ENTRIES);
 	dbg_set(DBG_LAST_LEN, skb->len);
 	if (bpf_skb_load_bytes(skb, 0, &word0, sizeof(word0)) == 0)
 		dbg_set(DBG_LAST_WORD0, word0);
-
-	/*
-	 * Detect the framing from the packet itself instead of
-	 * assuming it from l2_mode: the e2e captures showed the
-	 * strip being applied to a packet whose header was already
-	 * gone (the delivered packet was missing its first 14 IP
-	 * bytes).  A veth frame carrying IPv4 has ethertype 0x0800
-	 * at [12..13]; an already-L3 packet does not (those bytes
-	 * are inside its IP header).  Only a positively framed
-	 * packet is parsed after ETH_HLEN and stripped.
-	 */
-	if (l2_mode) {
-		__u16 ethertype = 0;
-
-		if (bpf_skb_load_bytes(skb, 12, &ethertype,
-				       sizeof(ethertype)) == 0 &&
-		    ethertype == bpf_htons(ETH_P_IP)) {
-			hdr_off = ETH_HLEN;
-			framed = true;
-		}
-	}
+	if (l2_mode)
+		dbg_inc(DBG_FRAMED);
 
 	if (parse_flow_key(skb, hdr_off, &fk) < 0)
 		return TC_ACT_OK; /* non-IPv4 / unparseable: pass */
@@ -413,24 +356,21 @@ int mux_from_front(struct __sk_buff *skb)
 	ifindex = bpf_map_lookup_elem(&peer_dev, &peer_id);
 	if (!ifindex || *ifindex == 0)
 		return TC_ACT_SHOT; /* steered peer has no device: drop */
-	target_ifindex = *ifindex;
 
-	if (framed)
-		dbg_inc(DBG_FRAMED);
-
-	/* wg devices are L3: remove the interconnect Ethernet header. */
-	if (framed) {
-		dbg_inc(DBG_STRIP_CALLS);
-		if (strip_l2_header(skb) < 0)
-			return TC_ACT_SHOT;
-		dbg_set(DBG_AFTER_LEN, skb->len);
-		word0 = 0;
-		if (bpf_skb_load_bytes(skb, 0, &word0, sizeof(word0)) == 0)
-			dbg_set(DBG_AFTER_WORD0, word0);
-	}
-
+	/*
+	 * NO header stripping here — bpf_redirect does it.  The wg
+	 * device is not a MAC-header-xmit device, so the redirect
+	 * core (__bpf_redirect_no_mac, net/core/filter.c) pulls
+	 * skb_network_offset(skb) bytes itself: it expects the
+	 * packet in the standard received state, data at the MAC
+	 * header with the network header pointing at the L3 header.
+	 * Stripping in the program as well removes the header
+	 * twice (the e2e saga in git history: adjust_room variants,
+	 * an XDP variant and an in-place copy all delivered packets
+	 * missing exactly their first 14 IP bytes for this reason).
+	 */
 	dbg_inc(DBG_REDIRECTS);
-	return bpf_redirect(target_ifindex, 0);
+	return bpf_redirect(*ifindex, 0);
 }
 
 /* ------------------------------------------------------------------ */
