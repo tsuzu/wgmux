@@ -8,8 +8,23 @@
  * no kernel FIB lookup, no ip_forward and no TTL decrement happen inside
  * the backend.
  *
+ *   mux_strip_l2:   XDP on the backend end of a VETH interconnect.
+ *                   XDP is the earliest receive point, where the data
+ *                   pointer contractually starts at the Ethernet
+ *                   header, so bpf_xdp_adjust_head() can strip it with
+ *                   exact pull semantics.  Selects the Peer (same maps
+ *                   as mux_from_front) and records the flow, then
+ *                   passes the now-L3 packet up to mux_from_front,
+ *                   which performs the redirect.  Only IPv4 frames
+ *                   destined for a steered prefix are stripped; ARP
+ *                   and everything else pass untouched.
+ *                   (netkit interconnects are L3 already and do not
+ *                   use this program.)
+ *
  *   mux_from_front: TC ingress on the backend end of the interconnect.
- *                   Parses the inner IPv4 packet, selects a Peer and
+ *                   The packet is always L3 here (netkit natively, or
+ *                   stripped by mux_strip_l2 on veth).  Parses the
+ *                   inner IPv4 packet, selects a Peer and
  *                   bpf_redirect()s the packet to that Peer's wg device
  *                   (egress).
  *
@@ -17,6 +32,17 @@
  *                   that replies return via the same Peer, then
  *                   bpf_redirect()s the packet out of the interconnect
  *                   backend end (egress) toward the main netns.
+ *
+ * Why not strip with bpf_skb_adjust_room() in TC?  Reading
+ * __bpf_skb_adjust_room/bpf_skb_net_hdr_pop in net/core/filter.c:
+ * the helper deletes len_diff bytes at offset (mac_header_len [+ L3
+ * base len for NET]) from skb->data and then pulls len_diff bytes —
+ * it is a tunnel-decap primitive that PRESERVES the outer headers.
+ * With a 14-byte MAC header present there is no mode whose deletion
+ * window starts at offset 0, so it cannot remove the outermost
+ * Ethernet header; the e2e captures showed it eating IP/TCP header
+ * bytes instead (see git history).  Its GROW direction is, however,
+ * exactly the encap operation mux_from_wg needs.
  *
  * Wire format / map contract (fixed — the Go loader depends on it):
  * see NOTES.md in this directory.
@@ -217,6 +243,126 @@ static __always_inline __u32 flow_hash(const struct flow_key *fk)
 	return h;
 }
 
+/*
+ * Shared peer selection: an established flow (flow_peer) wins;
+ * otherwise the steering LPM decides by destination and the choice
+ * is recorded so the flow sticks to its peer.  Returns 0 and sets
+ * *peer_id_out, or -1 when the destination is not steered.
+ */
+static __always_inline int select_peer(const struct flow_key *fk,
+				       __u32 *peer_id_out)
+{
+	__u32 *pinned = bpf_map_lookup_elem(&flow_peer, fk);
+
+	if (pinned) {
+		*peer_id_out = *pinned;
+		return 0;
+	}
+
+	struct steering_key skey = {
+		.prefixlen = 32,
+		.addr = fk->daddr,
+	};
+	struct steering_val *val = bpf_map_lookup_elem(&steering, &skey);
+	__u32 idx;
+
+	if (!val)
+		return -1;
+
+	if (val->count == 0 || val->count > MAX_CANDIDATE_PEERS)
+		return -1;
+
+	if (val->policy == 0) {
+		if (val->active >= val->count)
+			return -1;
+		idx = val->active;
+	} else if (val->policy == 1) {
+		idx = flow_hash(fk) % val->count;
+	} else {
+		return -1; /* unknown policy */
+	}
+
+	/*
+	 * Mask the index to the array bounds so the verifier can
+	 * prove the peer_id[] access is in range.  The mask is a
+	 * no-op semantically (idx < count <= 4 in both policies
+	 * above), but it must survive compilation: barrier_var hides
+	 * idx's provenance so clang cannot delete the mask as
+	 * redundant (see barrier_var).
+	 */
+	barrier_var(idx);
+	idx &= MAX_CANDIDATE_PEERS - 1;
+	*peer_id_out = val->peer_id[idx];
+
+	bpf_map_update_elem(&flow_peer, fk, peer_id_out, BPF_ANY);
+	return 0;
+}
+
+/* XDP twin of parse_flow_key (bpf_xdp_load_bytes instead of _skb_). */
+static __always_inline int parse_flow_key_xdp(struct xdp_md *ctx,
+					      __u32 hdr_off,
+					      struct flow_key *fk)
+{
+	struct iphdr iph = {};
+	__u32 ihl;
+
+	if (bpf_xdp_load_bytes(ctx, hdr_off, &iph, sizeof(iph)) < 0)
+		return -1;
+
+	if (iph.version != 4)
+		return -1;
+
+	if (iph.ihl < sizeof(iph) / 4 || iph.ihl > 15)
+		return -1;
+	ihl = (__u32)iph.ihl * 4;
+
+	__builtin_memset(fk, 0, sizeof(*fk));
+	fk->saddr = iph.saddr;
+	fk->daddr = iph.daddr;
+	fk->proto = iph.protocol;
+
+	if (iph.protocol == IPPROTO_TCP || iph.protocol == IPPROTO_UDP) {
+		__u16 ports[2] = {};
+
+		if (bpf_xdp_load_bytes(ctx, hdr_off + ihl, ports,
+				       sizeof(ports)) < 0)
+			return -1;
+		fk->sport = ports[0];
+		fk->dport = ports[1];
+	}
+
+	return 0;
+}
+
+/* ------------------------------------------------------------------ */
+/* Program S (veth interconnect only): strip the Ethernet header at    */
+/* XDP, where the data pointer contractually starts at it.             */
+/* ------------------------------------------------------------------ */
+
+SEC("xdp")
+int mux_strip_l2(struct xdp_md *ctx)
+{
+	struct flow_key fk;
+	__u32 peer_id;
+
+	/* Only framed IPv4 is of interest; everything else (ARP,
+	 * IPv6, ...) passes with its header untouched.
+	 */
+	if (parse_flow_key_xdp(ctx, ETH_HLEN, &fk) < 0)
+		return XDP_PASS;
+
+	/* Only steered destinations get stripped: an unsteered
+	 * packet must reach the backend stack exactly as framed.
+	 */
+	if (select_peer(&fk, &peer_id) < 0)
+		return XDP_PASS;
+
+	if (bpf_xdp_adjust_head(ctx, ETH_HLEN) < 0)
+		return XDP_PASS;
+
+	return XDP_PASS;
+}
+
 /* ------------------------------------------------------------------ */
 /* Program A: interconnect (backend end) -> selected wg device         */
 /* ------------------------------------------------------------------ */
@@ -224,88 +370,25 @@ static __always_inline __u32 flow_hash(const struct flow_key *fk)
 SEC("tcx/ingress")
 int mux_from_front(struct __sk_buff *skb)
 {
-	const __u32 hdr_off = l2_mode ? ETH_HLEN : 0;
 	struct flow_key fk;
 	__u32 peer_id;
 	__u32 *ifindex;
 
-	if (parse_flow_key(skb, hdr_off, &fk) < 0)
+	/* The packet is L3 here in both interconnect modes (see the
+	 * file header): parse at offset 0.
+	 */
+	if (parse_flow_key(skb, 0, &fk) < 0)
 		return TC_ACT_OK; /* non-IPv4 / unparseable: pass */
 
-	/* 1. An established flow stays on its peer. */
-	__u32 *pinned = bpf_map_lookup_elem(&flow_peer, &fk);
+	if (select_peer(&fk, &peer_id) < 0)
+		return TC_ACT_OK; /* not a steered destination */
 
-	if (pinned) {
-		peer_id = *pinned;
-	} else {
-		/* 2. Otherwise steer by the destination address. */
-		struct steering_key skey = {
-			.prefixlen = 32,
-			.addr = fk.daddr,
-		};
-		struct steering_val *val =
-			bpf_map_lookup_elem(&steering, &skey);
-		__u32 idx;
-
-		if (!val)
-			return TC_ACT_OK; /* not a steered destination */
-
-		if (val->count == 0 || val->count > MAX_CANDIDATE_PEERS)
-			return TC_ACT_OK;
-
-		if (val->policy == 0) {
-			if (val->active >= val->count)
-				return TC_ACT_OK;
-			idx = val->active;
-		} else if (val->policy == 1) {
-			idx = flow_hash(&fk) % val->count;
-		} else {
-			return TC_ACT_OK; /* unknown policy */
-		}
-
-		/*
-		 * Mask the index to the array bounds so the verifier
-		 * can prove the peer_id[] access is in range.  The mask
-		 * is a no-op semantically (idx < count <= 4 in both
-		 * policies above), but it must survive compilation:
-		 * barrier_var hides idx's provenance so clang cannot
-		 * delete the mask as redundant (see barrier_var).
-		 */
-		barrier_var(idx);
-		idx &= MAX_CANDIDATE_PEERS - 1;
-		peer_id = val->peer_id[idx];
-
-		bpf_map_update_elem(&flow_peer, &fk, &peer_id, BPF_ANY);
-	}
-
-	/* 3. Resolve the peer to its wg device in the backend netns. */
+	/* Resolve the peer to its wg device in the backend netns. */
 	ifindex = bpf_map_lookup_elem(&peer_dev, &peer_id);
 	if (!ifindex || *ifindex == 0)
 		return TC_ACT_SHOT; /* steered peer has no device: drop */
 
-	/* Copy out of the map before touching the packet. */
-	{
-		__u32 target_ifindex = *ifindex;
-
-		/* 4. wg devices are L3: drop the interconnect header. */
-		if (l2_mode) {
-			/*
-			 * BPF_ADJ_ROOM_NET, not _MAC: with _MAC the strip
-			 * consumed 28 bytes instead of 14 on the veth
-			 * receive path (the containerlab e2e captured the
-			 * packet at the wg device starting mid-IP-header:
-			 * the MAC-mode adjustment is anchored at the MAC
-			 * header and double-counts the data/mac offset on
-			 * this path). _NET anchors at the network header,
-			 * which is exactly the boundary being removed.
-			 */
-			if (bpf_skb_adjust_room(skb, -(__s32)ETH_HLEN,
-						 BPF_ADJ_ROOM_NET, 0) < 0)
-				return TC_ACT_SHOT;
-		}
-
-		return bpf_redirect(target_ifindex, 0);
-	}
+	return bpf_redirect(*ifindex, 0);
 }
 
 /* ------------------------------------------------------------------ */
@@ -361,12 +444,16 @@ int mux_from_wg(struct __sk_buff *skb)
 		 * The packet must cross a veth to reach the main
 		 * netns, so it needs an Ethernet header again.
 		 * point-to-point link: fixed MACs, no ARP involved.
-		 * BPF_ADJ_ROOM_NET for the same reason as in
-		 * mux_from_front (a wg receive skb has no meaningful
-		 * MAC header to anchor _MAC at).
+		 *
+		 * GROW with BPF_ADJ_ROOM_MAC is the helper's designed
+		 * encap case (see the file header): a wg receive skb
+		 * has no MAC header (mac_header_len == 0), so the room
+		 * is inserted at offset 0, in front of the IP header,
+		 * and the data pointer ends up at the inserted room,
+		 * ready for the store_bytes below.
 		 */
 		if (bpf_skb_adjust_room(skb, (__s32)ETH_HLEN,
-					 BPF_ADJ_ROOM_NET, 0) < 0)
+					 BPF_ADJ_ROOM_MAC, 0) < 0)
 			return TC_ACT_SHOT;
 
 		if (bpf_skb_store_bytes(skb, 0, &eth, sizeof(eth), 0) < 0)

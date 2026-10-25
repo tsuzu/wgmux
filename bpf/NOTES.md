@@ -55,14 +55,28 @@ per-instance constant (see below).
 ## Per-instance constants (`const volatile`, rewritten by the loader)
 
 - `l2_mode` (`bool`) — `true` when the interconnect is veth: packets
-  at the interconnect carry an Ethernet header.
-  `mux_from_front` parses after `ETH_HLEN` and removes the header with
-  `bpf_skb_adjust_room(skb, -ETH_HLEN, BPF_ADJ_ROOM_MAC, 0)` before
-  redirecting to the L3 wg device; `mux_from_wg` grows the room back
+  at the interconnect carry an Ethernet header. The header is
+  stripped by `mux_strip_l2` (XDP on the backend end: XDP is the
+  earliest receive point, where data contractually starts at the
+  Ethernet header, so `bpf_xdp_adjust_head` has exact pull
+  semantics; it also performs peer selection so unsteered frames —
+  ARP, traffic for the backend stack itself — pass unstripped).
+  `mux_from_front` therefore always parses at offset 0, in both
+  modes. In the return direction `mux_from_wg` grows the room back
+  with `bpf_skb_adjust_room(skb, +ETH_HLEN, BPF_ADJ_ROOM_MAC, 0)`
   and writes an Ethernet header (`dst = front_mac`,
   `src = back_mac`, `ethertype = ETH_P_IP`). `false` for netkit L3:
   packets are raw IP at the interconnect in both directions and no
   header conversion happens.
+  (`bpf_skb_adjust_room` cannot do the strip: per
+  net/core/filter.c's `bpf_skb_net_hdr_pop`, a shrink deletes
+  `len_diff` bytes at offset `mac_header_len` [+ L3 base length for
+  `BPF_ADJ_ROOM_NET`] from `skb->data` and then pulls `len_diff`
+  bytes — a tunnel-decap primitive that preserves the outer
+  headers. With a MAC header present, no mode's deletion window
+  starts at offset 0. The grow direction is the designed encap
+  case and works because a wg receive skb has `mac_header_len`
+  == 0, putting the insertion at offset 0.)
 - `own_peer_id` (`__u32`) — only used by `mux_from_wg`: the peer_id of
   the wg device that instance is attached to; recorded into
   `flow_peer` for the flows arriving from that Peer.
