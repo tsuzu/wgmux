@@ -332,11 +332,33 @@ static __always_inline int strip_l2_header(struct __sk_buff *skb)
 SEC("tcx/ingress")
 int mux_from_front(struct __sk_buff *skb)
 {
-	const __u32 hdr_off = l2_mode ? ETH_HLEN : 0;
 	struct flow_key fk;
 	__u32 peer_id;
 	__u32 *ifindex;
 	__u32 target_ifindex;
+	__u32 hdr_off = 0;
+	bool framed = false;
+
+	/*
+	 * Detect the framing from the packet itself instead of
+	 * assuming it from l2_mode: the e2e captures showed the
+	 * strip being applied to a packet whose header was already
+	 * gone (the delivered packet was missing its first 14 IP
+	 * bytes).  A veth frame carrying IPv4 has ethertype 0x0800
+	 * at [12..13]; an already-L3 packet does not (those bytes
+	 * are inside its IP header).  Only a positively framed
+	 * packet is parsed after ETH_HLEN and stripped.
+	 */
+	if (l2_mode) {
+		__u16 ethertype = 0;
+
+		if (bpf_skb_load_bytes(skb, 12, &ethertype,
+				       sizeof(ethertype)) == 0 &&
+		    ethertype == bpf_htons(ETH_P_IP)) {
+			hdr_off = ETH_HLEN;
+			framed = true;
+		}
+	}
 
 	if (parse_flow_key(skb, hdr_off, &fk) < 0)
 		return TC_ACT_OK; /* non-IPv4 / unparseable: pass */
@@ -351,7 +373,7 @@ int mux_from_front(struct __sk_buff *skb)
 	target_ifindex = *ifindex;
 
 	/* wg devices are L3: remove the interconnect Ethernet header. */
-	if (l2_mode && strip_l2_header(skb) < 0)
+	if (framed && strip_l2_header(skb) < 0)
 		return TC_ACT_SHOT;
 
 	return bpf_redirect(target_ifindex, 0);
