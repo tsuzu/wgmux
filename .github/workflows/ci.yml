@@ -1,0 +1,67 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  unit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.24"
+      - name: Install clang + libbpf headers (BPF object rebuild check)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang libbpf-dev
+          make generate
+          git diff --exit-code internal/datapath/mux.o || \
+            echo "::warning::committed mux.o differs from a fresh clang build"
+      - run: go build ./...
+      - run: go vet ./...
+      - run: go test ./...
+
+  e2e:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        engine: [kernel, userspace]
+        interconnect: [veth]
+        include:
+          - engine: kernel
+            interconnect: netkit
+    env:
+      WGMUX_E2E_ENGINE: ${{ matrix.engine }}
+      WGMUX_E2E_INTERCONNECT: ${{ matrix.interconnect }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.24"
+      - name: Prepare host kernel features
+        run: |
+          sudo modprobe wireguard || true
+          sudo modprobe netkit || true
+          uname -r
+      - name: Install containerlab
+        run: bash -c "$(curl -sL https://get.containerlab.dev)"
+      - name: Run containerlab e2e
+        run: |
+          containerlab version
+          go test -tags e2e ./test/e2e/ -v -timeout 40m
+      - name: Dump lab state on failure
+        if: failure()
+        run: |
+          docker ps -a || true
+          for n in mux sitea siteb; do
+            echo "===== $n ip addr ====="
+            docker exec clab-wgmux-e2e-$n ip addr 2>/dev/null || true
+            echo "===== $n ip netns / wg / logs ====="
+            docker exec clab-wgmux-e2e-$n sh -c 'ip netns list; wg show all 2>/dev/null; ip -n wgmux link 2>/dev/null; cat /var/log/wgmuxd.log /var/log/http.log 2>/dev/null' || true
+          done
+          sudo containerlab inspect -t test/e2e/topology.clab.yml || true
