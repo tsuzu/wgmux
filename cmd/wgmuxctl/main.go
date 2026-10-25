@@ -155,6 +155,8 @@ func cmdStatus(args []string) error {
 	if dbg, err := datapath.DebugSnapshot(cfg.PinDir); err == nil {
 		fmt.Printf("datapath: entries %d framed %d strips %d redirects %d last_len %d last_word0 %08x after_len %d after_word0 %08x\n",
 			dbg[0], dbg[1], dbg[2], dbg[7], dbg[3], dbg[4], dbg[5], dbg[6])
+		fmt.Printf("datapath-wg: entries %d cfg_fail %d grow_fail %d store_fail %d redirects %d\n",
+			dbg[8], dbg[9], dbg[10], dbg[11], dbg[12])
 	}
 	return nil
 }

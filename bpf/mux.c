@@ -166,6 +166,11 @@ struct {
 #define DBG_AFTER_LEN 5	     /* unused (kept for index stability) */
 #define DBG_AFTER_WORD0 6    /* unused (kept for index stability) */
 #define DBG_REDIRECTS 7	     /* bpf_redirect calls from mux_from_front */
+#define DBG_WG_ENTRIES 8     /* mux_from_wg invocations */
+#define DBG_WG_CFG_FAIL 9    /* runtime_cfg missing/back_ifindex 0 */
+#define DBG_WG_GROW_FAIL 10  /* bpf_skb_adjust_room grow failed */
+#define DBG_WG_STORE_FAIL 11 /* bpf_skb_store_bytes of the eth header failed */
+#define DBG_WG_REDIRECTS 12  /* bpf_redirect calls from mux_from_wg */
 
 static __always_inline void dbg_set(__u32 idx, __u64 val)
 {
@@ -387,6 +392,8 @@ int mux_from_wg(struct __sk_buff *skb)
 	__u32 back_ifindex;
 	__u32 own = own_peer_id;
 
+	dbg_inc(DBG_WG_ENTRIES);
+
 	/* wg devices are L3, so the packet is raw IP in both modes. */
 	if (parse_flow_key(skb, 0, &fk) < 0)
 		return TC_ACT_OK; /* non-IPv4 / unparseable: pass */
@@ -407,8 +414,10 @@ int mux_from_wg(struct __sk_buff *skb)
 	bpf_map_update_elem(&flow_peer, &rev, &own, BPF_ANY);
 
 	cfg = bpf_map_lookup_elem(&runtime_cfg, &zero);
-	if (!cfg || cfg->back_ifindex == 0)
+	if (!cfg || cfg->back_ifindex == 0) {
+		dbg_inc(DBG_WG_CFG_FAIL);
 		return TC_ACT_SHOT; /* not (yet) configured: drop */
+	}
 
 	/* Copy everything out of the map before touching the packet. */
 	back_ifindex = cfg->back_ifindex;
@@ -435,14 +444,20 @@ int mux_from_wg(struct __sk_buff *skb)
 		 * ready for the store_bytes below.
 		 */
 		if (bpf_skb_adjust_room(skb, (__s32)ETH_HLEN,
-					 BPF_ADJ_ROOM_MAC, 0) < 0)
+					 BPF_ADJ_ROOM_MAC,
+					 BPF_F_ADJ_ROOM_ENCAP_L2_ETH) < 0) {
+			dbg_inc(DBG_WG_GROW_FAIL);
 			return TC_ACT_SHOT;
+		}
 
-		if (bpf_skb_store_bytes(skb, 0, &eth, sizeof(eth), 0) < 0)
+		if (bpf_skb_store_bytes(skb, 0, &eth, sizeof(eth), 0) < 0) {
+			dbg_inc(DBG_WG_STORE_FAIL);
 			return TC_ACT_SHOT;
+		}
 	}
 	/* netkit L3 mode: no header to add, the packet stays raw IP. */
 
+	dbg_inc(DBG_WG_REDIRECTS);
 	return bpf_redirect(back_ifindex, 0);
 }
 
