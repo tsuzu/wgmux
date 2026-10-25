@@ -55,12 +55,12 @@ per-instance constant (see below).
 ## Per-instance constants (`const volatile`, rewritten by the loader)
 
 - `l2_mode` (`bool`) — `true` when the interconnect is veth: packets
-  at the interconnect carry an Ethernet header. The header is
-  stripped by `mux_strip_l2` (XDP on the backend end: XDP is the
-  earliest receive point, where data contractually starts at the
-  Ethernet header, so `bpf_xdp_adjust_head` has exact pull
-  semantics; it also performs peer selection so unsteered frames —
-  ARP, traffic for the backend stack itself — pass unstripped).
+  at the interconnect carry an Ethernet header. `mux_strip_l2`
+  (XDP on the backend end) performs peer selection for steered
+  IPv4 frames and records the flow; it does not strip anything —
+  on veth, an XDP_PASS frame goes through the driver's
+  `eth_type_trans()`, which pulls the Ethernet header as part of
+  normal delivery (stripping in XDP as well pulled it twice).
   `mux_from_front` therefore always parses at offset 0, in both
   modes. In the return direction `mux_from_wg` grows the room back
   with `bpf_skb_adjust_room(skb, +ETH_HLEN, BPF_ADJ_ROOM_MAC, 0)`

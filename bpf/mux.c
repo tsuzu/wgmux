@@ -9,15 +9,16 @@
  * the backend.
  *
  *   mux_strip_l2:   XDP on the backend end of a VETH interconnect.
- *                   XDP is the earliest receive point, where the data
- *                   pointer contractually starts at the Ethernet
- *                   header, so bpf_xdp_adjust_head() can strip it with
- *                   exact pull semantics.  Selects the Peer (same maps
- *                   as mux_from_front) and records the flow, then
- *                   passes the now-L3 packet up to mux_from_front,
- *                   which performs the redirect.  Only IPv4 frames
- *                   destined for a steered prefix are stripped; ARP
- *                   and everything else pass untouched.
+ *                   Selects the Peer (same maps as mux_from_front)
+ *                   and records the flow for steered IPv4 frames,
+ *                   then passes.  It does NOT strip the Ethernet
+ *                   header itself: on veth, the driver's
+ *                   eth_type_trans() pulls the header when an
+ *                   XDP_PASS frame is delivered, so by the time the
+ *                   packet reaches mux_from_front at TC it is L3.
+ *                   (Stripping in XDP too would pull the header
+ *                   twice — 28 bytes — as the e2e captures showed.)
+ *                   ARP and unsteered frames pass untouched.
  *                   (netkit interconnects are L3 already and do not
  *                   use this program.)
  *
@@ -335,8 +336,8 @@ static __always_inline int parse_flow_key_xdp(struct xdp_md *ctx,
 }
 
 /* ------------------------------------------------------------------ */
-/* Program S (veth interconnect only): strip the Ethernet header at    */
-/* XDP, where the data pointer contractually starts at it.             */
+/* Program S (veth interconnect only): peer selection at XDP; the     */
+/* driver strips the Ethernet header on delivery (see file header).   */
 /* ------------------------------------------------------------------ */
 
 SEC("xdp")
@@ -351,15 +352,21 @@ int mux_strip_l2(struct xdp_md *ctx)
 	if (parse_flow_key_xdp(ctx, ETH_HLEN, &fk) < 0)
 		return XDP_PASS;
 
-	/* Only steered destinations get stripped: an unsteered
+	/* Only steered destinations are of interest: an unsteered
 	 * packet must reach the backend stack exactly as framed.
 	 */
 	if (select_peer(&fk, &peer_id) < 0)
 		return XDP_PASS;
 
-	if (bpf_xdp_adjust_head(ctx, ETH_HLEN) < 0)
-		return XDP_PASS;
-
+	/* Deliberately NO bpf_xdp_adjust_head() here: on veth, an
+	 * XDP_PASS frame is handed to eth_type_trans() by the driver,
+	 * which pulls the Ethernet header itself as part of normal
+	 * delivery.  Stripping in XDP as well pulled 14 bytes of the
+	 * IP header too (28 total; verified by the e2e captures).
+	 * The flow record written by select_peer is what
+	 * mux_from_front needs; the header is gone by the time the
+	 * packet reaches TC.
+	 */
 	return XDP_PASS;
 }
 
