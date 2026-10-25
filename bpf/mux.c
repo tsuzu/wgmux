@@ -94,10 +94,20 @@ struct runtime_cfg {
 /* Load-time constants (rewritten per instance by the Go loader)       */
 /* ------------------------------------------------------------------ */
 
-/* true: interconnect is veth (packets there carry an Ethernet header).
- * false: interconnect is netkit L3 (packets there are raw IP).
+/* Packets at the interconnect carry a 14-byte L2-shaped header at
+ * the backend TC point: a real Ethernet header for veth, and a
+ * zeroed dummy header for netkit L3 (netkit devices are
+ * ether_setup-based; the stack reaches the peer with no ARP using
+ * zero addresses).  The loader therefore always sets this true;
+ * it remains a constant so the framing assumption is explicit.
  */
 const volatile bool l2_mode;
+
+/* true (veth interconnect): mux_from_wg hands return packets to
+ * the backend stack for the last hop instead of redirecting (see
+ * mux_from_wg).  false (netkit): redirect in both directions.
+ */
+const volatile bool stack_return;
 
 /* Only used by mux_from_wg: the peer_id of the wg device this program
  * instance is attached to.
@@ -414,7 +424,7 @@ int mux_from_wg(struct __sk_buff *skb)
 	rev.proto = fk.proto;
 	bpf_map_update_elem(&flow_peer, &rev, &own, BPF_ANY);
 
-	if (l2_mode) {
+	if (stack_return) {
 		/*
 		 * Veth mode: hand the packet to the backend stack
 		 * (TC_ACT_OK) and let it forward the packet out of

@@ -61,7 +61,7 @@ type Info struct {
 	PeerDevice map[uint32]string
 }
 
-func loadSpec(l2Mode bool, ownPeerID *uint32) (*ebpf.CollectionSpec, error) {
+func loadSpec(stackReturn bool, ownPeerID *uint32) (*ebpf.CollectionSpec, error) {
 	spec, err := ebpf.LoadCollectionSpecFromReader(bytes.NewReader(muxObj))
 	if err != nil {
 		return nil, fmt.Errorf("load BPF spec: %w", err)
@@ -74,8 +74,16 @@ func loadSpec(l2Mode bool, ownPeerID *uint32) (*ebpf.CollectionSpec, error) {
 		}
 		return vs.Set(v)
 	}
-	if err := set("l2_mode", l2Mode); err != nil {
+	// The interconnect always presents a 14-byte L2-shaped header
+	// at the backend TC point (a real Ethernet header for veth; a
+	// zeroed dummy header for netkit L3, whose devices are
+	// ether_setup-based with zero addresses), so from_front always
+	// parses after ETH_HLEN: l2_mode is unconditionally true.
+	if err := set("l2_mode", true); err != nil {
 		return nil, fmt.Errorf("set l2_mode: %w", err)
+	}
+	if err := set("stack_return", stackReturn); err != nil {
+		return nil, fmt.Errorf("set stack_return: %w", err)
 	}
 	if ownPeerID != nil {
 		if err := set("own_peer_id", *ownPeerID); err != nil {
@@ -90,7 +98,7 @@ func loadSpec(l2Mode bool, ownPeerID *uint32) (*ebpf.CollectionSpec, error) {
 // steering decisions supplied by the control plane (via the daemon);
 // this package never decides policy itself.
 func Apply(spec api.ApplySpec, info Info, entries []steer.Entry) error {
-	l2 := spec.Interconnect == config.InterconnectVeth
+	l2 := spec.Interconnect == config.InterconnectVeth // stack_return: veth only
 	if err := os.MkdirAll(spec.PinDir, 0o755); err != nil {
 		return err
 	}
