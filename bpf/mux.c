@@ -459,9 +459,16 @@ int mux_from_wg(struct __sk_buff *skb)
 	/* Copy everything out of the map before touching the packet. */
 	back_ifindex = cfg->back_ifindex;
 
-	/* netkit L3 mode: no header to add, the packet stays raw IP. */
+	/* netkit mode: hand the packet to the interconnect's peer
+	 * (the front device in the main namespace) with
+	 * bpf_redirect_peer.  A plain bpf_redirect to the netkit
+	 * device dies in __bpf_redirect_common on the same
+	 * mac_header check as veth; the peer handoff is netkit's
+	 * designed cross-namespace path — the packet restarts as a
+	 * receive on the front device, no MAC state required.
+	 */
 	dbg_inc(DBG_WG_REDIRECTS);
-	return bpf_redirect(back_ifindex, 0);
+	return bpf_redirect_peer(back_ifindex, 0);
 }
 
 char _license[] SEC("license") = "GPL";
