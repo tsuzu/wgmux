@@ -17,6 +17,7 @@ import (
 	"github.com/tsuzu/wgmux/internal/api"
 	"github.com/tsuzu/wgmux/internal/bgp"
 	"github.com/tsuzu/wgmux/internal/config"
+	"github.com/tsuzu/wgmux/internal/datapath"
 	"github.com/tsuzu/wgmux/internal/monitor"
 )
 
@@ -150,6 +151,10 @@ func cmdStatus(args []string) error {
 			fmt.Printf(" %s", nameByID[id])
 		}
 		fmt.Println(")")
+	}
+	if dbg, err := datapath.DebugSnapshot(cfg.PinDir); err == nil {
+		fmt.Printf("datapath: entries %d framed %d strips %d redirects %d last_len %d last_word0 %08x after_len %d after_word0 %08x\n",
+			dbg[0], dbg[1], dbg[2], dbg[7], dbg[3], dbg[4], dbg[5], dbg[6])
 	}
 	return nil
 }

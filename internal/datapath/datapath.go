@@ -46,6 +46,7 @@ const (
 	MapFlowPeer   = "flow_peer"
 	MapPeerDev    = "peer_dev"
 	MapRuntimeCfg = "runtime_cfg"
+	MapDebug      = "debug"
 )
 
 // Info describes the already-built topology the datapath programs steer
@@ -282,6 +283,23 @@ func OpenPinnedSteering(pinDir string) (*ebpf.Map, error) {
 		return nil, fmt.Errorf("open pinned steering map (is wgmux applied?): %w", err)
 	}
 	return m, nil
+}
+
+// DebugSnapshot reads the mux_from_front observability counters
+// from the pinned debug map. Indices are defined in bpf/mux.c.
+func DebugSnapshot(pinDir string) ([]uint64, error) {
+	m, err := ebpf.LoadPinnedMap(filepath.Join(pinDir, MapDebug), nil)
+	if err != nil {
+		return nil, fmt.Errorf("open pinned debug map: %w", err)
+	}
+	defer m.Close()
+	out := make([]uint64, 16)
+	for i := range out {
+		if err := m.Lookup(uint32(i), &out[i]); err != nil {
+			return nil, fmt.Errorf("read debug[%d]: %w", i, err)
+		}
+	}
+	return out, nil
 }
 
 // SetActive flips the active candidate of one prefix in the pinned

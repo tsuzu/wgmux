@@ -144,6 +144,43 @@ struct {
 	__type(value, struct runtime_cfg);
 } runtime_cfg SEC(".maps");
 
+/*
+ * Datapath observability counters (indices fixed; see NOTES.md).
+ * Written by mux_from_front; read by wgmuxctl status.
+ */
+struct {
+	__uint(type, BPF_MAP_TYPE_ARRAY);
+	__uint(max_entries, 16);
+	__uint(pinning, LIBBPF_PIN_BY_NAME);
+	__type(key, __u32);
+	__type(value, __u64);
+} debug SEC(".maps");
+
+#define DBG_FRONT_ENTRIES 0  /* mux_from_front invocations */
+#define DBG_FRAMED 1	     /* of those, detected as Ethernet-framed */
+#define DBG_STRIP_CALLS 2    /* strip_l2_header invocations */
+#define DBG_LAST_LEN 3	     /* skb->len at entry */
+#define DBG_LAST_WORD0 4     /* first 4 bytes at entry */
+#define DBG_AFTER_LEN 5	     /* skb->len after strip */
+#define DBG_AFTER_WORD0 6    /* first 4 bytes after strip */
+#define DBG_REDIRECTS 7	     /* bpf_redirect calls from mux_from_front */
+
+static __always_inline void dbg_set(__u32 idx, __u64 val)
+{
+	__u64 *slot = bpf_map_lookup_elem(&debug, &idx);
+
+	if (slot)
+		*slot = val;
+}
+
+static __always_inline void dbg_inc(__u32 idx)
+{
+	__u64 *slot = bpf_map_lookup_elem(&debug, &idx);
+
+	if (slot)
+		__sync_fetch_and_add(slot, 1);
+}
+
 /* ------------------------------------------------------------------ */
 /* Helpers                                                             */
 /* ------------------------------------------------------------------ */
@@ -338,6 +375,12 @@ int mux_from_front(struct __sk_buff *skb)
 	__u32 target_ifindex;
 	__u32 hdr_off = 0;
 	bool framed = false;
+	__u32 word0 = 0;
+
+	dbg_inc(DBG_FRONT_ENTRIES);
+	dbg_set(DBG_LAST_LEN, skb->len);
+	if (bpf_skb_load_bytes(skb, 0, &word0, sizeof(word0)) == 0)
+		dbg_set(DBG_LAST_WORD0, word0);
 
 	/*
 	 * Detect the framing from the packet itself instead of
@@ -372,10 +415,21 @@ int mux_from_front(struct __sk_buff *skb)
 		return TC_ACT_SHOT; /* steered peer has no device: drop */
 	target_ifindex = *ifindex;
 
-	/* wg devices are L3: remove the interconnect Ethernet header. */
-	if (framed && strip_l2_header(skb) < 0)
-		return TC_ACT_SHOT;
+	if (framed)
+		dbg_inc(DBG_FRAMED);
 
+	/* wg devices are L3: remove the interconnect Ethernet header. */
+	if (framed) {
+		dbg_inc(DBG_STRIP_CALLS);
+		if (strip_l2_header(skb) < 0)
+			return TC_ACT_SHOT;
+		dbg_set(DBG_AFTER_LEN, skb->len);
+		word0 = 0;
+		if (bpf_skb_load_bytes(skb, 0, &word0, sizeof(word0)) == 0)
+			dbg_set(DBG_AFTER_WORD0, word0);
+	}
+
+	dbg_inc(DBG_REDIRECTS);
 	return bpf_redirect(target_ifindex, 0);
 }
 
