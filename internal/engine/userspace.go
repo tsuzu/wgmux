@@ -221,6 +221,15 @@ func (m *userspaceMux) forwardFromFront(pkt []byte, peers map[uint32]*userspaceP
 	m.counters.frontRedirects.Add(1)
 }
 
+// tunWriteHeadroom is the scratch space a native TUN may require
+// in front of the packet on Write: a vnet-hdr TUN reads a virtio-net
+// header at [offset-10:offset) and fails the write without it.
+// Zeroes are a valid header (GSO_NONE — one unfragmented packet),
+// and a TUN without vnet-hdr simply skips the offset. (wireguard-go's
+// own device passes its TUN writes with headroom for this reason;
+// offset 0 works for Read but NOT for Write.)
+const tunWriteHeadroom = 16
+
 // fromPeer handles one decrypted packet arriving from a peer: pin
 // the reverse flow (as mux_from_wg does) and write the packet to
 // the front TUN.
@@ -229,7 +238,9 @@ func (m *userspaceMux) fromPeer(front tun.Device, flows *flowTable, peerID uint3
 	if fk, ok := parseFlow(pkt); ok {
 		flows.put(fk.Reverse(), peerID)
 	}
-	if _, err := front.Write([][]byte{pkt}, 0); err != nil {
+	buf := make([]byte, tunWriteHeadroom+len(pkt))
+	copy(buf[tunWriteHeadroom:], pkt)
+	if _, err := front.Write([][]byte{buf}, tunWriteHeadroom); err != nil {
 		m.counters.wgDrops.Add(1)
 		return
 	}
