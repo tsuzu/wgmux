@@ -53,15 +53,22 @@ const (
 	DefaultMuxName = "wg-mux"
 )
 
-// KernelOptions are the kernel engine's creation parameters for
-// one mux (see api.KernelParams). They are meaningless for the
-// userspace engine and ignored there.
+// KernelOptions carries the one kernel creation parameter a mux
+// config may set — the backend-address override — plus two GUARD
+// fields: interconnect/attach are daemon-startup settings
+// (wgmuxd -interconnect/-attach), and a config that names them is
+// asserting what the daemon must be running; wgmuxctl checks them
+// against the daemon and refuses a mismatch rather than silently
+// building a different datapath than the config describes.
+// backend_ns / pin_dir remain parseable only to warn: both are
+// derived from the mux name (and the daemon's pin root) and are
+// never configured.
 type KernelOptions struct {
-	BackendNS      string `yaml:"backend_ns"`
-	Interconnect   string `yaml:"interconnect"`
-	Attach         string `yaml:"attach"`
-	PinDir         string `yaml:"pin_dir"`
 	BackendAddress string `yaml:"backend_address"`
+	Interconnect   string `yaml:"interconnect"` // guard: must match the daemon's
+	Attach         string `yaml:"attach"`       // guard: must match the daemon's
+	BackendNS      string `yaml:"backend_ns"`   // deprecated: derived, ignored with a warning
+	PinDir         string `yaml:"pin_dir"`      // deprecated: derived, ignored with a warning
 }
 
 // Front is the mux's one visible interface. Its name is the mux
@@ -211,17 +218,20 @@ type Mux struct {
 	specified creationSpecified
 }
 
-// creationSpecified records which creation parameters were
+// creationSpecified records which creation/guard fields were
 // explicitly present in the source (YAML fields / CLI flags), as
 // opposed to defaulted — the control plane uses it to check an
-// apply against an existing instance's immutable creation
-// parameters without flagging parameters the user never mentioned.
+// apply against the daemon's startup configuration and an existing
+// instance's immutable creation parameters without flagging values
+// the user never mentioned.
 type creationSpecified struct {
-	engine, interconnect, attach, backendNS, pinDir, backendAddr bool
+	engine, interconnect, attach, backendAddr bool
 }
 
-// CreationSpec is a mux's creation-parameter intent: the values,
-// plus which of them were explicitly specified.
+// CreationSpec is a mux's creation intent: the engine kind and
+// kernel shape it assumes (guards against the daemon's startup
+// configuration) and its one true creation parameter, the
+// backend-address override — each with a presence flag.
 type CreationSpec struct {
 	Engine            string
 	EngineSet         bool
@@ -229,10 +239,6 @@ type CreationSpec struct {
 	InterconnectSet   bool
 	Attach            string
 	AttachSet         bool
-	BackendNS         string
-	BackendNSSet      bool
-	PinDir            string
-	PinDirSet         bool
 	BackendAddress    string
 	BackendAddressSet bool
 }
@@ -243,8 +249,6 @@ func (m *Mux) CreationSpec() CreationSpec {
 		Engine: m.Engine, EngineSet: m.specified.engine,
 		Interconnect: m.Kernel.Interconnect, InterconnectSet: m.specified.interconnect,
 		Attach: m.Kernel.Attach, AttachSet: m.specified.attach,
-		BackendNS: m.Kernel.BackendNS, BackendNSSet: m.specified.backendNS,
-		PinDir: m.Kernel.PinDir, PinDirSet: m.specified.pinDir,
 		BackendAddress: m.Kernel.BackendAddress, BackendAddressSet: m.specified.backendAddr,
 	}
 }
@@ -256,8 +260,6 @@ func (m *Mux) captureSpecified() {
 		engine:       m.Engine != "",
 		interconnect: m.Kernel.Interconnect != "",
 		attach:       m.Kernel.Attach != "",
-		backendNS:    m.Kernel.BackendNS != "",
-		pinDir:       m.Kernel.PinDir != "",
 		backendAddr:  m.Kernel.BackendAddress != "",
 	}
 }
@@ -412,6 +414,14 @@ func (m *Mux) finalize(dir string) error {
 	m.dir = dir
 	if m.Name == "" {
 		m.Name = DefaultMuxName
+	}
+	if m.Kernel.BackendNS != "" {
+		m.Warnings = append(m.Warnings, fmt.Sprintf("mux %s: kernel.backend_ns is derived from the mux name (wgmux-%s); ignoring the configured value", m.Name, m.Name))
+		m.Kernel.BackendNS = ""
+	}
+	if m.Kernel.PinDir != "" {
+		m.Warnings = append(m.Warnings, fmt.Sprintf("mux %s: kernel.pin_dir is derived from the daemon's -pin-root and the mux name; ignoring the configured value", m.Name))
+		m.Kernel.PinDir = ""
 	}
 	if m.Engine == "" {
 		m.Engine = EngineKernel
@@ -711,20 +721,21 @@ func (m *Mux) validate() error {
 		return fmt.Errorf("mux name %q exceeds 15 characters (it is also the front interface name)", m.Name)
 	}
 	switch m.Engine {
-	case EngineKernel:
-		switch m.Kernel.Interconnect {
-		case "", InterconnectVeth, InterconnectNetkit:
-		default:
-			return fmt.Errorf("mux %q: kernel.interconnect must be %q or %q, got %q", m.Name, InterconnectVeth, InterconnectNetkit, m.Kernel.Interconnect)
-		}
-		switch m.Kernel.Attach {
-		case "", AttachTCX, AttachTC:
-		default:
-			return fmt.Errorf("mux %q: kernel.attach must be %q or %q, got %q", m.Name, AttachTCX, AttachTC, m.Kernel.Attach)
-		}
-	case EngineUserspace:
+	case EngineKernel, EngineUserspace:
 	default:
 		return fmt.Errorf("mux %q: engine must be %q or %q, got %q", m.Name, EngineKernel, EngineUserspace, m.Engine)
+	}
+	// interconnect/attach in a config are guards (the real setting
+	// is wgmuxd's startup flags); validate their shape here.
+	switch m.Kernel.Interconnect {
+	case "", InterconnectVeth, InterconnectNetkit:
+	default:
+		return fmt.Errorf("mux %q: kernel.interconnect must be %q or %q, got %q", m.Name, InterconnectVeth, InterconnectNetkit, m.Kernel.Interconnect)
+	}
+	switch m.Kernel.Attach {
+	case "", AttachTCX, AttachTC:
+	default:
+		return fmt.Errorf("mux %q: kernel.attach must be %q or %q, got %q", m.Name, AttachTCX, AttachTC, m.Kernel.Attach)
 	}
 	if err := m.validateBGP(); err != nil {
 		return err

@@ -82,11 +82,12 @@ commands:
 
 apply flags (direct wg-file mode):
   -name wg-mux        instance name (= front interface name; default wg-mux)
-  -engine kernel      kernel | userspace        (creation parameter)
-  -interconnect veth  veth | netkit             (creation parameter, kernel only)
-  -attach tcx         tcx | tc                  (creation parameter, kernel only)
+  -engine kernel      assert the daemon's engine kind (a wgmuxd startup setting)
+  -interconnect veth  assert the daemon's interconnect (kernel, startup setting)
+  -attach tcx         assert the daemon's attach mode (kernel, startup setting)
   -backend-address A  interconnect backend address (creation parameter, kernel only)
   -front-address A    override the front address derived from the conf files
+  -manage-routes      install routes to the front interface (default true)
   -monitor, -bgp      also run the policy daemons in the foreground`)
 }
 
@@ -149,14 +150,25 @@ func selectOneMux(cfg *config.Config, name string) (*config.Mux, error) {
 	return muxes[0], nil
 }
 
-// ensureAndApply creates the instance if the daemon does not have
-// it yet (verifying creation-parameter immutability if it does),
-// then applies the desired state.
+// ensureAndApply checks the apply's daemon-level assumptions
+// (engine kind, kernel shape — startup settings), creates the
+// instance if the daemon does not have it yet (verifying
+// creation-parameter immutability if it does), then applies the
+// desired state.
 func ensureAndApply(ctx context.Context, client *api.Client, mux *config.Mux, intent config.CreationSpec) error {
+	dinfo, err := client.Info(ctx)
+	if err != nil {
+		return err
+	}
+	if err := checkDaemon(dinfo, intent); err != nil {
+		return err
+	}
 	spec, err := buildSpec(mux)
 	if err != nil {
 		return err
 	}
+	// The front's name is the instance name.
+	spec.Front.Name = mux.Name
 	infos, err := client.List(ctx)
 	if err != nil {
 		return err
@@ -181,14 +193,13 @@ func ensureAndApply(ctx context.Context, client *api.Client, mux *config.Mux, in
 func cmdApply(args []string) error {
 	fs := flag.NewFlagSet("apply", flag.ContinueOnError)
 	cf := addCommon(fs)
-	engine := fs.String("engine", "", "kernel | userspace (creation parameter)")
-	interconnect := fs.String("interconnect", "", "veth | netkit (creation parameter, kernel engine)")
-	attach := fs.String("attach", "", "tcx | tc (creation parameter, kernel engine)")
-	backendNS := fs.String("backend-ns", "", "backend namespace name (creation parameter, kernel engine)")
-	pinDir := fs.String("pin-dir", "", "BPF pin dir (creation parameter, kernel engine)")
+	engine := fs.String("engine", "", "assert the daemon's engine kind: kernel | userspace (a wgmuxd startup setting)")
+	interconnect := fs.String("interconnect", "", "assert the daemon's interconnect: veth | netkit (startup setting)")
+	attach := fs.String("attach", "", "assert the daemon's attach mode: tcx | tc (startup setting)")
 	backendAddr := fs.String("backend-address", "", "interconnect backend address (creation parameter, kernel engine)")
 	frontAddr := fs.String("front-address", "", "override the derived front address")
 	frontMTU := fs.Int("front-mtu", 0, "override the front MTU")
+	manageRoutes := fs.Bool("manage-routes", true, "install main-namespace routes to the front interface")
 	withMonitor := fs.Bool("monitor", false, "also run the failover policy in the foreground")
 	withBGP := fs.Bool("bgp", false, "also run the BGP selection source in the foreground")
 	if err := fs.Parse(args); err != nil {
@@ -224,14 +235,6 @@ func cmdApply(args []string) error {
 			mux.Kernel.Attach = *attach
 			intent.Attach, intent.AttachSet = *attach, true
 		}
-		if visited["backend-ns"] {
-			mux.Kernel.BackendNS = *backendNS
-			intent.BackendNS, intent.BackendNSSet = *backendNS, true
-		}
-		if visited["pin-dir"] {
-			mux.Kernel.PinDir = *pinDir
-			intent.PinDir, intent.PinDirSet = *pinDir, true
-		}
 		if visited["backend-address"] {
 			mux.Kernel.BackendAddress = *backendAddr
 			intent.BackendAddress, intent.BackendAddressSet = *backendAddr, true
@@ -241,6 +244,9 @@ func cmdApply(args []string) error {
 		}
 		if visited["front-mtu"] {
 			mux.Front.MTU = *frontMTU
+		}
+		if visited["manage-routes"] {
+			mux.ManageRoutes = manageRoutes
 		}
 		client := clientFor(cf, nil)
 		if err := ensureAndApply(ctx, client, mux, intent); err != nil {
@@ -383,11 +389,14 @@ func cmdStatus(args []string) error {
 }
 
 func printState(st api.State, createdAt time.Time) {
-	head := fmt.Sprintf("mux %s (engine %s", st.Mux, st.Engine)
+	head := fmt.Sprintf("mux %s (engine %s, status %s", st.Mux, st.Engine, st.Status)
 	if !createdAt.IsZero() {
 		head += ", created " + createdAt.Format(time.RFC3339)
 	}
 	fmt.Println(head + ")")
+	if st.Error != "" {
+		fmt.Printf("  error: %s\n", st.Error)
+	}
 	nameByID := map[uint32]string{}
 	for _, p := range st.Peers {
 		nameByID[p.ID] = p.Name
@@ -439,10 +448,12 @@ func cmdList(args []string) error {
 		return err
 	}
 	for _, info := range infos {
-		line := fmt.Sprintf("%s\tengine=%s\tcreated=%s", info.Mux, info.Engine, info.CreatedAt.Format(time.RFC3339))
-		if info.Engine == api.EngineKernel {
-			line += fmt.Sprintf("\tinterconnect=%s attach=%s backend_ns=%s pin_dir=%s backend_address=%s",
-				info.Kernel.Interconnect, info.Kernel.Attach, info.Kernel.BackendNS, info.Kernel.PinDir, info.Kernel.BackendAddress)
+		line := fmt.Sprintf("%s\tengine=%s\tstatus=%s\tcreated=%s", info.Mux, info.Engine, info.Status, info.CreatedAt.Format(time.RFC3339))
+		if info.BackendAddress != "" {
+			line += "\tbackend_address=" + info.BackendAddress
+		}
+		if info.Error != "" {
+			line += "\terror=" + info.Error
 		}
 		fmt.Println(line)
 	}

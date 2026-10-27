@@ -10,18 +10,13 @@ import (
 )
 
 // buildCreate translates a mux definition into instance-creation
-// parameters. These are fixed for the instance's lifetime.
+// parameters: the name, plus the one per-instance creation input —
+// the kernel backend-address override. The engine kind is NOT
+// here: it is the daemon's startup choice.
 func buildCreate(mux *config.Mux) api.CreateParams {
 	return api.CreateParams{
-		Mux:    mux.Name,
-		Engine: mux.Engine,
-		Kernel: api.KernelParams{
-			BackendNS:      mux.Kernel.BackendNS,
-			Interconnect:   mux.Kernel.Interconnect,
-			Attach:         mux.Kernel.Attach,
-			PinDir:         mux.Kernel.PinDir,
-			BackendAddress: mux.Kernel.BackendAddress,
-		},
+		Mux:            mux.Name,
+		BackendAddress: mux.Kernel.BackendAddress,
 	}
 }
 
@@ -81,33 +76,41 @@ func buildSpec(mux *config.Mux) (api.ApplySpec, error) {
 	return spec, nil
 }
 
-// checkImmutable verifies an apply against an existing instance is
-// not trying to change its creation parameters. Only parameters
-// the user actually specified in this invocation (config.CreationSpec
-// tracks presence) are checked; unspecified ones accept whatever
-// the instance already has.
-func checkImmutable(info api.InstanceInfo, intent config.CreationSpec) error {
-	mismatch := func(field, have, want string) error {
-		return fmt.Errorf("mux %q already exists with %s=%q, but this apply specifies %q: creation parameters are immutable — destroy the instance first to change them",
-			info.Mux, field, have, want)
-	}
+// checkDaemon verifies the apply's engine-kind and kernel-shape
+// assumptions (config.CreationSpec tracks which were actually
+// specified) against the daemon's STARTUP configuration. Engine
+// kind, interconnect and attach are chosen when wgmuxd starts; an
+// apply that assumes different ones is rejected here with the
+// reason, instead of silently building something else.
+func checkDaemon(info api.DaemonInfo, intent config.CreationSpec) error {
 	if intent.EngineSet && intent.Engine != info.Engine {
-		return mismatch("engine", info.Engine, intent.Engine)
+		return fmt.Errorf("this apply assumes engine %q, but the daemon was started with -engine %s (engine kind is a wgmuxd startup setting; use the daemon started for %q, with its own -socket)",
+			intent.Engine, info.Engine, intent.Engine)
 	}
-	if intent.InterconnectSet && info.Kernel.Interconnect != "" && intent.Interconnect != info.Kernel.Interconnect {
-		return mismatch("interconnect", info.Kernel.Interconnect, intent.Interconnect)
+	if intent.InterconnectSet && info.Interconnect != "" && intent.Interconnect != info.Interconnect {
+		return fmt.Errorf("this apply assumes interconnect %q, but the daemon was started with -interconnect %s (a wgmuxd startup setting)",
+			intent.Interconnect, info.Interconnect)
 	}
-	if intent.AttachSet && info.Kernel.Attach != "" && intent.Attach != info.Kernel.Attach {
-		return mismatch("attach", info.Kernel.Attach, intent.Attach)
+	if intent.AttachSet && info.Attach != "" && intent.Attach != info.Attach {
+		return fmt.Errorf("this apply assumes attach %q, but the daemon was started with -attach %s (a wgmuxd startup setting)",
+			intent.Attach, info.Attach)
 	}
-	if intent.BackendNSSet && info.Kernel.BackendNS != "" && intent.BackendNS != info.Kernel.BackendNS {
-		return mismatch("backend_ns", info.Kernel.BackendNS, intent.BackendNS)
+	return nil
+}
+
+// checkImmutable verifies an apply against an existing instance is
+// not trying to change its creation parameters. The one per-instance
+// creation parameter is the backend-address override; specifying a
+// different one (or introducing one after the fact) for an instance
+// that already exists is rejected — destroy + recreate is the way
+// to change it.
+func checkImmutable(info api.InstanceInfo, intent config.CreationSpec) error {
+	if info.Status == api.StatusOrphaned {
+		return fmt.Errorf("mux %q is orphaned: its stored spec belongs to a daemon of a different engine kind, and this daemon leaves it untouched", info.Mux)
 	}
-	if intent.PinDirSet && info.Kernel.PinDir != "" && intent.PinDir != info.Kernel.PinDir {
-		return mismatch("pin_dir", info.Kernel.PinDir, intent.PinDir)
-	}
-	if intent.BackendAddressSet && info.Kernel.BackendAddress != "" && intent.BackendAddress != info.Kernel.BackendAddress {
-		return mismatch("backend_address", info.Kernel.BackendAddress, intent.BackendAddress)
+	if intent.BackendAddressSet && intent.BackendAddress != info.BackendAddress {
+		return fmt.Errorf("mux %q already exists with backend_address=%q, but this apply specifies %q: creation parameters are immutable — destroy the instance first to change them",
+			info.Mux, info.BackendAddress, intent.BackendAddress)
 	}
 	return nil
 }
