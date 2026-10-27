@@ -45,6 +45,15 @@ func newKernelPeers(ctx *Context) *kernelPeers {
 	return &kernelPeers{ctx: ctx, specs: map[string]api.PeerSpec{}}
 }
 
+// adoptSpecs registers peer specs WITHOUT creating or configuring
+// any device: the devices already exist (daemon-restart adoption),
+// and Peers() only needs the name/ID table to read their state.
+func (e *kernelPeers) adoptSpecs(peers []api.PeerSpec) {
+	for _, spec := range peers {
+		e.specs[spec.Name] = spec
+	}
+}
+
 func (e *kernelPeers) AddPeer(spec api.PeerSpec) (peerRef, error) {
 	name := DeviceName(spec.Name)
 	if len(name) >= 16 {

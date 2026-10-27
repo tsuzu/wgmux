@@ -16,7 +16,6 @@ import (
 	"golang.zx2c4.com/wireguard/tun"
 
 	"github.com/tsuzu/wgmux/internal/api"
-	"github.com/tsuzu/wgmux/internal/config"
 	"github.com/tsuzu/wgmux/internal/steer"
 )
 
@@ -54,14 +53,17 @@ type userspacePeer struct {
 	vt   *chanTUN
 }
 
-func newUserspaceMux(params api.CreateParams) *userspaceMux {
-	return &userspaceMux{name: params.Mux}
+func newUserspaceMux(name string) *userspaceMux {
+	return &userspaceMux{name: name}
 }
 
-func (m *userspaceMux) Kind() string { return config.EngineUserspace }
-
-func (m *userspaceMux) CreationParams() api.CreateParams {
-	return api.CreateParams{Mux: m.name, Engine: m.Kind()}
+// frontName resolves the front TUN's name: the applied spec's,
+// else the instance name (the same by construction).
+func (m *userspaceMux) frontName() string {
+	if m.spec != nil && m.spec.Front.Name != "" {
+		return m.spec.Front.Name
+	}
+	return m.name
 }
 
 func (m *userspaceMux) Apply(spec api.ApplySpec) error {
@@ -83,9 +85,13 @@ func (m *userspaceMux) Apply(spec api.ApplySpec) error {
 	table := steer.NewTable(entries)
 	flows := newFlowTable(65536)
 
-	front, err := tun.CreateTUN(m.name, mtu)
+	frontName := spec.Front.Name
+	if frontName == "" {
+		frontName = m.name
+	}
+	front, err := tun.CreateTUN(frontName, mtu)
 	if err != nil {
-		return fmt.Errorf("create front TUN %s: %w", m.name, err)
+		return fmt.Errorf("create front TUN %s: %w", frontName, err)
 	}
 	// fail unwinds everything built so far, in local variables.
 	var (
@@ -111,9 +117,9 @@ func (m *userspaceMux) Apply(spec api.ApplySpec) error {
 	if err != nil {
 		return fail(fmt.Errorf("netlink handle: %w", err))
 	}
-	link, err := main.LinkByName(m.name)
+	link, err := main.LinkByName(frontName)
 	if err != nil {
-		return fail(fmt.Errorf("find front TUN %s: %w", m.name, err))
+		return fail(fmt.Errorf("find front TUN %s: %w", frontName, err))
 	}
 	addr, err := netlink.ParseAddr(spec.Front.Address)
 	if err != nil {
@@ -277,7 +283,7 @@ func (m *userspaceMux) SetActive(prefix *net.IPNet, peerID uint32) error {
 func (m *userspaceMux) State() (api.State, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	st := api.State{Mux: m.name, Engine: m.Kind()}
+	st := api.State{Mux: m.name}
 	if m.spec == nil {
 		return st, fmt.Errorf("mux %q: nothing applied", m.name)
 	}
@@ -336,7 +342,7 @@ func (m *userspaceMux) closeLocked() error {
 			firstErr = err
 		}
 	}
-	if link, err := m.main.LinkByName(m.name); err == nil {
+	if link, err := m.main.LinkByName(m.frontName()); err == nil {
 		m.main.LinkDel(link)
 	}
 	m.main.Close()

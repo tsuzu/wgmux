@@ -1,11 +1,12 @@
 // Package api is the contract between wgmux's control plane and data
 // plane. The data-plane daemon (wgmuxd) hosts any number of mux
-// instances; every request addresses one instance by name. An instance
-// is created once with its engine kind and engine-private construction
-// parameters (Create), which stay fixed for the instance's lifetime;
-// afterwards the control plane pushes desired state (Apply), single
-// selection changes (SetActive) and reads snapshots (State) — none of
-// which mention the engine or its internals.
+// instances, all of ONE engine kind — the kind is a daemon-startup
+// choice (wgmuxd -engine), not a per-instance parameter. Every
+// request addresses one instance by name. An instance is created
+// once (Create; the only creation parameter is an optional
+// backend-address override) and afterwards the control plane pushes
+// desired state (Apply), single selection changes (SetActive) and
+// reads snapshots (State).
 //
 // The split is deliberate: replacing a decision maker (static config,
 // failover logic, GoBGP, FRR) never requires datapath changes, and the
@@ -27,41 +28,60 @@ const (
 	EngineUserspace = "userspace"
 )
 
-// KernelParams are the kernel engine's construction parameters. They
-// are kernel-implementation concepts (a backend namespace, an
-// interconnect pair, BPF pinning) that no other engine has, so they
-// live here — on the daemon side of instance creation — and never in
-// ApplySpec. Empty fields take defaults derived from the instance
-// name (see the daemon/engine packages).
-type KernelParams struct {
-	BackendNS    string `json:"backend_ns,omitempty"`   // default: wgmux-<mux>
-	Interconnect string `json:"interconnect,omitempty"` // veth | netkit, default veth
-	Attach       string `json:"attach,omitempty"`       // tcx | tc, default tcx
-	PinDir       string `json:"pin_dir,omitempty"`      // default: <pin root>/wgmux/<mux>
-	// BackendAddress is the interconnect's backend-end address
-	// (CIDR), fixed at creation. Empty means: derive once from the
-	// first applied front address, then keep it for the instance's
-	// lifetime.
+// CreateParams are the instance-construction parameters, fixed for
+// the instance's lifetime. Deliberately minimal: the engine kind is
+// the daemon's (a startup flag), and everything kernel-shaped
+// (backend namespace, interconnect, attach mode, pin dir) is either
+// a daemon-startup setting or derived from the instance name.
+type CreateParams struct {
+	Mux string `json:"mux"`
+	// BackendAddress optionally overrides the kernel engine's
+	// interconnect backend-end address (CIDR). Empty means: derive
+	// once from the first applied front address, then keep it for
+	// the instance's lifetime. Ignored by the userspace engine.
 	BackendAddress string `json:"backend_address,omitempty"`
 }
 
-// CreateParams are the instance-construction parameters: fixed for
-// the instance's lifetime.
-type CreateParams struct {
-	Mux    string       `json:"mux"`
-	Engine string       `json:"engine"` // kernel | userspace
-	Kernel KernelParams `json:"kernel,omitempty"`
+// Instance lifecycle states reported by List and State.
+const (
+	// StatusActive: created/applied by this daemon process.
+	StatusActive = "active"
+	// StatusAdopted: at startup, the kernel objects were still
+	// there and were adopted without touching the datapath.
+	StatusAdopted = "adopted"
+	// StatusRestored: rebuilt from the spec store at startup.
+	StatusRestored = "restored"
+	// StatusStored: present in the spec store but not activated
+	// (restore disabled, or nothing applied yet).
+	StatusStored = "stored"
+	// StatusFailed: restore tried and failed; Error says why.
+	StatusFailed = "failed"
+	// StatusOrphaned: the store entry belongs to a daemon of the
+	// other engine kind; this daemon leaves it untouched.
+	StatusOrphaned = "orphaned"
+)
+
+// InstanceInfo describes one mux instance known to the daemon.
+type InstanceInfo struct {
+	Mux            string    `json:"mux"`
+	Engine         string    `json:"engine"` // the daemon's engine kind
+	Status         string    `json:"status"`
+	Error          string    `json:"error,omitempty"`
+	BackendAddress string    `json:"backend_address,omitempty"`
+	CreatedAt      time.Time `json:"created_at"`
 }
 
-// InstanceInfo describes one hosted mux instance, including its
-// resolved creation parameters (so control-plane tools can verify
-// an apply is not trying to change them — creation parameters are
-// immutable; changing one means destroy + recreate).
-type InstanceInfo struct {
-	Mux       string       `json:"mux"`
-	Engine    string       `json:"engine"`
-	Kernel    KernelParams `json:"kernel,omitempty"`
-	CreatedAt time.Time    `json:"created_at"`
+// DaemonInfo describes the daemon itself: the startup configuration
+// every instance shares. Control-plane tools use it to reject
+// applies that assume a different engine kind or kernel datapath
+// shape than the daemon was started with.
+type DaemonInfo struct {
+	Engine       string `json:"engine"`
+	Interconnect string `json:"interconnect,omitempty"` // kernel daemons
+	Attach       string `json:"attach,omitempty"`       // kernel daemons
+	PinRoot      string `json:"pin_root,omitempty"`
+	StateDir     string `json:"state_dir,omitempty"`
+	Restore      bool   `json:"restore"`
 }
 
 // PeerSpec is one multiplexed peer as the control plane wants it.
@@ -88,17 +108,18 @@ type PrefixSpec struct {
 }
 
 // FrontSpec is the one interface visible in the main namespace.
-// The interface's NAME is the mux instance's name (like wg-quick,
-// where the config name is the interface name), so it is not
-// repeated here; address and MTU are per-Apply desired state.
+// Its name is the mux instance's name (like wg-quick, where the
+// config name is the interface name); engines fall back to the
+// instance name when Name is empty.
 type FrontSpec struct {
+	Name    string `json:"name"`
 	Address string `json:"address"` // CIDR
 	MTU     int    `json:"mtu"`
 }
 
-// ApplySpec is the full desired state of one mux instance. It carries
-// only engine-neutral state: which engine an instance runs is a
-// construction parameter (CreateParams), not desired state.
+// ApplySpec is the full desired state of one mux instance. It
+// carries only engine-neutral state: which engine an instance runs
+// is the daemon's startup choice, not desired state.
 type ApplySpec struct {
 	Front        FrontSpec    `json:"front"`
 	ManageRoutes bool         `json:"manage_routes"`
@@ -132,7 +153,9 @@ type PrefixState struct {
 // correspond.
 type State struct {
 	Mux      string            `json:"mux"`
-	Engine   string            `json:"engine"`
+	Engine   string            `json:"engine"` // the daemon's kind, reported by the engine side
+	Status   string            `json:"status"`
+	Error    string            `json:"error,omitempty"`
 	Peers    []PeerState       `json:"peers"`
 	Prefixes []PrefixState     `json:"prefixes"`
 	Counters map[string]uint64 `json:"counters,omitempty"`
@@ -176,6 +199,7 @@ type Handler interface {
 	SetActive(req SetActiveRequest) error
 	State(req MuxRequest) (State, error)
 	List() ([]InstanceInfo, error)
+	Info() (DaemonInfo, error)
 }
 
 // Serve accepts connections on l and dispatches to h until l is closed.
@@ -251,6 +275,8 @@ func dispatch(h Handler, req request) response {
 		return wrap(h.State(mr))
 	case "list":
 		return wrap(h.List())
+	case "info":
+		return wrap(h.Info())
 	default:
 		return response{Error: fmt.Sprintf("unknown method %q", req.Method)}
 	}
@@ -321,5 +347,11 @@ func (c *Client) State(ctx context.Context, mux string) (State, error) {
 func (c *Client) List(ctx context.Context) ([]InstanceInfo, error) {
 	var out []InstanceInfo
 	err := c.call(ctx, "list", struct{}{}, &out)
+	return out, err
+}
+
+func (c *Client) Info(ctx context.Context) (DaemonInfo, error) {
+	var out DaemonInfo
+	err := c.call(ctx, "info", struct{}{}, &out)
 	return out, err
 }

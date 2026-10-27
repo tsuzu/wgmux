@@ -1,9 +1,9 @@
 // Package engine defines the one interface both datapath
 // implementations sit behind. An Engine is a single mux instance:
-// created once with its kind and engine-private construction
-// parameters (api.CreateParams), which stay fixed for its lifetime,
-// it then accepts desired state (Apply), single selection changes
-// (SetActive) and reports snapshots (State) without the caller
+// created through the daemon's factory (the daemon is started with
+// ONE engine kind; the factory builds instances of that kind only),
+// it accepts desired state (Apply), single selection changes
+// (SetActive) and reports snapshots (State), without the caller
 // knowing which implementation it is:
 //
 //   - kernel: in-tree WireGuard devices, one per peer, in a hidden
@@ -30,14 +30,8 @@ import (
 
 // Engine is one mux instance's datapath.
 type Engine interface {
-	// Kind reports the engine kind ("kernel" | "userspace").
-	Kind() string
-	// CreationParams returns the instance's construction
-	// parameters with defaults resolved. They are immutable for
-	// the instance's lifetime.
-	CreationParams() api.CreateParams
-	// Apply reconciles the instance to the desired spec, rebuilding
-	// whatever it already had.
+	// Apply reconciles the instance to the desired spec,
+	// rebuilding whatever it already had.
 	Apply(spec api.ApplySpec) error
 	// SetActive retargets one prefix to a different candidate peer.
 	SetActive(prefix *net.IPNet, peerID uint32) error
@@ -47,27 +41,54 @@ type Engine interface {
 	Close() error
 }
 
-// Factory creates an Engine instance from construction parameters.
-// The daemon's registry is built on a Factory so tests can inject
-// fakes.
+// Adopter is implemented by engines whose instances can survive
+// the daemon process (the kernel engine): at startup the daemon
+// offers the stored spec, and Adopt re-attaches to the still-live
+// kernel objects WITHOUT touching the datapath, reporting true.
+// (false, nil) means "not adoptable — rebuild me instead".
+type Adopter interface {
+	Adopt(spec api.ApplySpec) (bool, error)
+}
+
+// DaemonOptions are the daemon-startup settings an engine factory
+// closes over: for the kernel engine, the interconnect/attach shape
+// shared by every instance and the bpffs pin root instance pin
+// dirs derive from.
+type DaemonOptions struct {
+	Interconnect string // kernel: veth | netkit
+	Attach       string // kernel: tcx | tc
+	PinRoot      string // kernel: bpffs base, default /sys/fs/bpf
+}
+
+// Factory creates Engine instances of one kind from creation
+// parameters. The daemon's registry is built on a Factory so tests
+// can inject fakes.
 type Factory func(params api.CreateParams) (Engine, error)
 
-// New is the production factory constructor. pinRoot is the
-// daemon-startup bpffs base (wgmuxd -pin-root, default /sys/fs/bpf)
-// from which kernel instances derive their per-instance pin dirs.
-func New(pinRoot string) Factory {
-	if pinRoot == "" {
-		pinRoot = "/sys/fs/bpf"
+// NewFactory returns the production factory for one engine kind —
+// the daemon's startup kind. Every instance it creates is of that
+// kind; there is no per-instance kind choice.
+func NewFactory(kind string, opts DaemonOptions) (Factory, error) {
+	if opts.PinRoot == "" {
+		opts.PinRoot = "/sys/fs/bpf"
 	}
-	return func(params api.CreateParams) (Engine, error) {
-		switch params.Engine {
-		case config.EngineKernel:
-			return newKernelMux(params, pinRoot), nil
-		case config.EngineUserspace:
-			return newUserspaceMux(params), nil
-		default:
-			return nil, fmt.Errorf("unknown engine %q", params.Engine)
-		}
+	if opts.Interconnect == "" {
+		opts.Interconnect = config.InterconnectVeth
+	}
+	if opts.Attach == "" {
+		opts.Attach = config.AttachTCX
+	}
+	switch kind {
+	case config.EngineKernel:
+		return func(params api.CreateParams) (Engine, error) {
+			return newKernelMux(params, opts), nil
+		}, nil
+	case config.EngineUserspace:
+		return func(params api.CreateParams) (Engine, error) {
+			return newUserspaceMux(params.Mux), nil
+		}, nil
+	default:
+		return nil, fmt.Errorf("unknown engine %q", kind)
 	}
 }
 

@@ -4,15 +4,30 @@ import (
 	"encoding/binary"
 	"fmt"
 	"net"
+	"os"
 	"path/filepath"
 	"sync"
 
+	"github.com/vishvananda/netns"
+
 	"github.com/tsuzu/wgmux/internal/api"
-	"github.com/tsuzu/wgmux/internal/config"
 	"github.com/tsuzu/wgmux/internal/datapath"
 	"github.com/tsuzu/wgmux/internal/steer"
 	"github.com/tsuzu/wgmux/internal/topology"
 )
+
+// kernelParams are the kernel engine's per-instance parameters.
+// Everything here is either a daemon-startup setting (interconnect,
+// attach, pin root) or derived from the instance name (backend ns,
+// pin dir) — the user configures none of it directly. The single
+// per-instance creation input is the backend-address override.
+type kernelParams struct {
+	BackendNS      string // wgmux-<name>
+	Interconnect   string // daemon startup
+	Attach         string // daemon startup
+	PinDir         string // <pin root>/wgmux/<name>
+	BackendAddress string // creation override; "" = derive at first Apply
+}
 
 // kernelMux is the kernel Engine: one mux instance realized as
 // per-peer in-tree WireGuard devices in a per-instance backend
@@ -21,7 +36,7 @@ import (
 // namespace".
 type kernelMux struct {
 	name string
-	kp   api.KernelParams // construction params, defaults resolved
+	kp   kernelParams
 
 	mu              sync.Mutex
 	spec            *api.ApplySpec
@@ -30,29 +45,26 @@ type kernelMux struct {
 	resolvedBackend string
 }
 
-func newKernelMux(params api.CreateParams, pinRoot string) *kernelMux {
-	kp := params.Kernel
-	if kp.BackendNS == "" {
-		kp.BackendNS = "wgmux-" + params.Mux
+func newKernelMux(params api.CreateParams, opts DaemonOptions) *kernelMux {
+	return &kernelMux{
+		name: params.Mux,
+		kp: kernelParams{
+			BackendNS:      "wgmux-" + params.Mux,
+			Interconnect:   opts.Interconnect,
+			Attach:         opts.Attach,
+			PinDir:         filepath.Join(opts.PinRoot, "wgmux", params.Mux),
+			BackendAddress: params.BackendAddress,
+		},
 	}
-	if kp.Interconnect == "" {
-		kp.Interconnect = config.InterconnectVeth
-	}
-	if kp.Attach == "" {
-		kp.Attach = config.AttachTCX
-	}
-	if kp.PinDir == "" {
-		kp.PinDir = filepath.Join(pinRoot, "wgmux", params.Mux)
-	}
-	return &kernelMux{name: params.Mux, kp: kp}
 }
 
-func (m *kernelMux) Kind() string { return config.EngineKernel }
-
-func (m *kernelMux) CreationParams() api.CreateParams {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	return api.CreateParams{Mux: m.name, Engine: m.Kind(), Kernel: m.kp}
+// frontName resolves the front interface name: the spec's, else the
+// instance name (they are the same by construction).
+func (m *kernelMux) frontName(spec *api.ApplySpec) string {
+	if spec.Front.Name != "" {
+		return spec.Front.Name
+	}
+	return m.name
 }
 
 // backendAddress resolves the interconnect's backend-end address:
@@ -115,7 +127,7 @@ func (m *kernelMux) Apply(spec api.ApplySpec) error {
 	topo, err := topology.Open(topology.Params{
 		BackendNS:      m.kp.BackendNS,
 		Interconnect:   m.kp.Interconnect,
-		FrontName:      m.name,
+		FrontName:      m.frontName(&spec),
 		FrontAddress:   spec.Front.Address,
 		BackendAddress: backendAddr,
 		MTU:            mtu,
@@ -200,7 +212,7 @@ func (m *kernelMux) SetActive(prefix *net.IPNet, peerID uint32) error {
 func (m *kernelMux) State() (api.State, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	st := api.State{Mux: m.name, Engine: m.Kind()}
+	st := api.State{Mux: m.name}
 	if m.spec == nil {
 		return st, fmt.Errorf("mux %q: nothing applied", m.name)
 	}
@@ -245,4 +257,75 @@ func (m *kernelMux) Close() error {
 		return nil
 	}
 	return m.teardownLocked()
+}
+
+// Adopt re-attaches this instance to kernel objects a previous
+// daemon process left behind (see docs/design.md, "Persistence and
+// recovery"). It probes first — backend namespace present, pin dir
+// present, steering map openable — and only then wires up in-memory
+// handles (topology handles, peer spec table). It never calls
+// datapath.Apply and never reconfigures a device: the datapath is
+// not touched. (false, nil) means the objects are not (fully)
+// there; the caller falls back to a rebuild Apply.
+func (m *kernelMux) Adopt(spec api.ApplySpec) (bool, error) {
+	h, err := netns.GetFromName(m.kp.BackendNS)
+	if err != nil {
+		return false, nil
+	}
+	h.Close()
+	if _, err := os.Stat(m.kp.PinDir); err != nil {
+		return false, nil
+	}
+	sm, err := datapath.OpenPinnedSteering(m.kp.PinDir)
+	if err != nil {
+		return false, nil
+	}
+	sm.Close()
+	if _, err := datapath.SteeringSnapshot(m.kp.PinDir); err != nil {
+		return false, nil
+	}
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.spec != nil {
+		return true, nil // already live
+	}
+	backendAddr, err := m.backendAddress(spec.Front.Address)
+	if err != nil {
+		return false, nil
+	}
+	mtu := spec.Front.MTU
+	if mtu == 0 {
+		mtu = 1420
+	}
+	prefixCIDRs := make([]string, 0, len(spec.Prefixes))
+	for _, p := range spec.Prefixes {
+		prefixCIDRs = append(prefixCIDRs, p.CIDR)
+	}
+	topo, err := topology.Open(topology.Params{
+		BackendNS:      m.kp.BackendNS,
+		Interconnect:   m.kp.Interconnect,
+		FrontName:      m.frontName(&spec),
+		FrontAddress:   spec.Front.Address,
+		BackendAddress: backendAddr,
+		MTU:            mtu,
+		ManageRoutes:   spec.ManageRoutes,
+		Prefixes:       prefixCIDRs,
+	})
+	if err != nil {
+		return false, nil
+	}
+	peers := newKernelPeers(&Context{
+		BackendNS:     m.kp.BackendNS,
+		BackendHandle: topo.BackendNsHandle(),
+		Main:          topo.Main,
+		Backend:       topo.Backend,
+		MTU:           mtu,
+	})
+	peers.adoptSpecs(spec.Peers)
+	m.topo = topo
+	m.peers = peers
+	specCopy := spec
+	m.spec = &specCopy
+	return true, nil
 }
