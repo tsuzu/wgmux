@@ -154,40 +154,44 @@ func selectOneMux(cfg *config.Config, name string) (*config.Mux, error) {
 // (engine kind, kernel shape — startup settings), creates the
 // instance if the daemon does not have it yet (verifying
 // creation-parameter immutability if it does), then applies the
-// desired state.
-func ensureAndApply(ctx context.Context, client *api.Client, mux *config.Mux, intent config.CreationSpec) error {
+// desired state. It returns the daemon's engine kind (the config's
+// own engine field is only a guard, never the source of truth).
+func ensureAndApply(ctx context.Context, client *api.Client, mux *config.Mux, intent config.CreationSpec) (string, error) {
 	dinfo, err := client.Info(ctx)
 	if err != nil {
-		return err
+		return "", err
 	}
 	if err := checkDaemon(dinfo, intent); err != nil {
-		return err
+		return "", err
 	}
 	spec, err := buildSpec(mux)
 	if err != nil {
-		return err
+		return "", err
 	}
 	// The front's name is the instance name.
 	spec.Front.Name = mux.Name
 	infos, err := client.List(ctx)
 	if err != nil {
-		return err
+		return "", err
 	}
 	exists := false
 	for _, info := range infos {
 		if info.Mux == mux.Name {
 			exists = true
 			if err := checkImmutable(info, intent); err != nil {
-				return err
+				return "", err
 			}
 		}
 	}
 	if !exists {
 		if err := client.Create(ctx, buildCreate(mux)); err != nil {
-			return err
+			return "", err
 		}
 	}
-	return client.Apply(ctx, mux.Name, spec)
+	if err := client.Apply(ctx, mux.Name, spec); err != nil {
+		return "", err
+	}
+	return dinfo.Engine, nil
 }
 
 func cmdApply(args []string) error {
@@ -249,11 +253,12 @@ func cmdApply(args []string) error {
 			mux.ManageRoutes = manageRoutes
 		}
 		client := clientFor(cf, nil)
-		if err := ensureAndApply(ctx, client, mux, intent); err != nil {
+		kind, err := ensureAndApply(ctx, client, mux, intent)
+		if err != nil {
 			return err
 		}
 		fmt.Printf("wgmuxctl: applied mux %s (engine=%s, %d peers, %d prefixes)\n",
-			mux.Name, mux.Engine, len(mux.Peers), len(mux.EffectivePrefixes))
+			mux.Name, kind, len(mux.Peers), len(mux.EffectivePrefixes))
 		if *withMonitor || *withBGP {
 			return runPolicies(mux, client, *withMonitor, *withBGP)
 		}
@@ -271,11 +276,12 @@ func cmdApply(args []string) error {
 	}
 	client := clientFor(cf, cfg)
 	for _, mux := range muxes {
-		if err := ensureAndApply(ctx, client, mux, mux.CreationSpec()); err != nil {
+		kind, err := ensureAndApply(ctx, client, mux, mux.CreationSpec())
+		if err != nil {
 			return err
 		}
 		fmt.Printf("wgmuxctl: applied mux %s (engine=%s, %d peers, %d prefixes)\n",
-			mux.Name, mux.Engine, len(mux.Peers), len(mux.EffectivePrefixes))
+			mux.Name, kind, len(mux.Peers), len(mux.EffectivePrefixes))
 	}
 	if *withMonitor || *withBGP {
 		mux, err := selectOneMux(cfg, *cf.name)
