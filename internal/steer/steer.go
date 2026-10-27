@@ -1,20 +1,25 @@
-// Package steer translates the declarative config into the exact values
-// written to the datapath's BPF maps, and mirrors the datapath's hash
-// selection so control-plane behaviour (status display, tests) matches
-// what the kernel program will do.
+// Package steer holds the steering model shared by every datapath
+// realization: the entries that say which peers may carry a prefix
+// and how one is picked, plus the flow hash the kernel programs use.
+// The kernel engine programs these entries into BPF maps; the
+// userspace engine evaluates the same entries in Go (Table). Because
+// both use Entry/Pick/Hash, a prefix selects the same peer either
+// way.
 package steer
 
 import (
 	"encoding/binary"
 	"fmt"
 	"net"
+	"sort"
+	"sync"
 
-	"github.com/tsuzu/wgmux/internal/config"
+	"github.com/tsuzu/wgmux/internal/api"
 )
 
-// Policy codes as stored in the steering map (see bpf/mux.c). The
-// datapath has no "failover": the control plane implements it by
-// rewriting the active index of a PolicyActive entry.
+// Policy codes as stored in the steering map (see bpf/mux.c) and in
+// Entry.Policy. The datapaths have no "failover": the control plane
+// implements it by rewriting the active index of a PolicyActive entry.
 const (
 	PolicyActive uint8 = 0
 	PolicyHash   uint8 = 1
@@ -34,7 +39,15 @@ func WireAddr(ip net.IP) uint32 {
 	return binary.LittleEndian.Uint32(ip.To4())
 }
 
-// Entry is one steering map value plus its LPM key.
+// WireIP is the inverse of WireAddr.
+func WireIP(w uint32) net.IP {
+	var b [4]byte
+	binary.LittleEndian.PutUint32(b[:], w)
+	return net.IPv4(b[0], b[1], b[2], b[3])
+}
+
+// Entry is one steering decision: the candidates for a prefix, which
+// one is active, and the selection policy.
 type Entry struct {
 	PrefixLen uint32
 	Addr      uint32 // wire representation, see WireAddr
@@ -44,38 +57,52 @@ type Entry struct {
 	Policy    uint8
 }
 
-// BuildEntries resolves a config into steering entries, one per prefix,
-// with peer IDs in candidate order.
-func BuildEntries(cfg *config.Config) ([]Entry, error) {
-	entries := make([]Entry, 0, len(cfg.Prefixes))
-	for _, p := range cfg.Prefixes {
+// Prefix returns the entry's prefix as a net.IPNet.
+func (e Entry) Prefix() *net.IPNet {
+	return &net.IPNet{
+		IP:   WireIP(e.Addr),
+		Mask: net.CIDRMask(int(e.PrefixLen), 32),
+	}
+}
+
+// ActivePeer returns the currently selected peer ID for
+// policy=active entries.
+func (e Entry) ActivePeer() uint32 {
+	if int(e.Active) < int(e.Count) {
+		return e.PeerIDs[e.Active]
+	}
+	return e.PeerIDs[0]
+}
+
+// EntriesFromSpec resolves control-plane prefix specs into steering
+// entries. Decision policies arrive already normalised: "hash" runs
+// the hash policy, everything else ("active", and the control-plane
+// policies failover/bgp that drive SetActive) runs as active.
+func EntriesFromSpec(prefixes []api.PrefixSpec) ([]Entry, error) {
+	out := make([]Entry, 0, len(prefixes))
+	for _, p := range prefixes {
 		_, ipnet, err := net.ParseCIDR(p.CIDR)
 		if err != nil {
-			return nil, fmt.Errorf("prefix %q: %w", p.CIDR, err)
+			return nil, fmt.Errorf("prefix %s: %w", p.CIDR, err)
 		}
 		ones, _ := ipnet.Mask.Size()
-		e := Entry{PrefixLen: uint32(ones)}
-		e.Addr = WireAddr(ipnet.IP)
-		for i, name := range p.Candidates {
-			peer := cfg.PeerByName(name)
-			if peer == nil {
-				return nil, fmt.Errorf("prefix %q: unknown candidate %q", p.CIDR, name)
+		e := Entry{PrefixLen: uint32(ones), Addr: WireAddr(ipnet.IP)}
+		for i, id := range p.CandidateIDs {
+			if i >= MaxCandidates {
+				return nil, fmt.Errorf("prefix %s: too many candidates", p.CIDR)
 			}
-			e.PeerIDs[i] = uint32(peer.ID)
-			if name == p.Active {
+			e.PeerIDs[i] = id
+			if id == p.ActiveID {
 				e.Active = uint8(i)
 			}
 		}
-		e.Count = uint8(len(p.Candidates))
-		switch p.Policy {
-		case config.PolicyHash:
+		e.Count = uint8(len(p.CandidateIDs))
+		if p.Policy == "hash" {
 			e.Policy = PolicyHash
-		default: // active and failover both run as active in the datapath
-			e.Policy = PolicyActive
 		}
-		entries = append(entries, e)
+		out = append(out, e)
 	}
-	return entries, nil
+	return out, nil
 }
 
 // FlowKey mirrors struct flow_key in bpf/mux.c. Addresses and ports are in
@@ -87,6 +114,18 @@ type FlowKey struct {
 	SPort uint16
 	DPort uint16
 	Proto uint8
+}
+
+// Reverse returns the key of the flow travelling in the opposite
+// direction (what the return path pins the original flow under).
+func (k FlowKey) Reverse() FlowKey {
+	return FlowKey{
+		SAddr: k.DAddr,
+		DAddr: k.SAddr,
+		SPort: k.DPort,
+		DPort: k.SPort,
+		Proto: k.Proto,
+	}
 }
 
 // Hash is an exact transcription of flow_hash() in bpf/mux.c, so the
@@ -124,4 +163,74 @@ func (e Entry) Pick(k FlowKey) int {
 		return int(e.Active)
 	}
 	return 0
+}
+
+// Table is the Go evaluation of a set of steering entries: a
+// longest-prefix-match lookup plus runtime activation changes. The
+// kernel engine programs the same entries into the BPF LPM trie
+// instead; both share Entry/Pick so selection semantics agree.
+type Table struct {
+	mu      sync.RWMutex
+	entries []Entry // sorted by PrefixLen, longest first
+	nets    []*net.IPNet
+}
+
+// NewTable builds a Table from entries (any order).
+func NewTable(entries []Entry) *Table {
+	es := make([]Entry, len(entries))
+	copy(es, entries)
+	sort.SliceStable(es, func(i, j int) bool { return es[i].PrefixLen > es[j].PrefixLen })
+	t := &Table{entries: es}
+	for _, e := range es {
+		t.nets = append(t.nets, e.Prefix())
+	}
+	return t
+}
+
+// Lookup returns the entry governing dst (longest prefix match).
+func (t *Table) Lookup(dst net.IP) (Entry, bool) {
+	dst4 := dst.To4()
+	if dst4 == nil {
+		return Entry{}, false
+	}
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+	for i, n := range t.nets {
+		if n.Contains(dst4) {
+			return t.entries[i], true
+		}
+	}
+	return Entry{}, false
+}
+
+// SetActive flips the active candidate of one prefix to peerID,
+// mirroring datapath.SetActive's semantics and errors.
+func (t *Table) SetActive(prefix *net.IPNet, peerID uint32) error {
+	ones, _ := prefix.Mask.Size()
+	addr := WireAddr(prefix.IP)
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	for i := range t.entries {
+		e := &t.entries[i]
+		if e.PrefixLen != uint32(ones) || e.Addr != addr {
+			continue
+		}
+		for j := 0; j < int(e.Count); j++ {
+			if e.PeerIDs[j] == peerID {
+				e.Active = uint8(j)
+				return nil
+			}
+		}
+		return fmt.Errorf("peer %d is not a candidate for prefix %s", peerID, prefix)
+	}
+	return fmt.Errorf("prefix %s not in steering table", prefix)
+}
+
+// Entries returns a snapshot of the current entries.
+func (t *Table) Entries() []Entry {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+	out := make([]Entry, len(t.entries))
+	copy(out, t.entries)
+	return out
 }

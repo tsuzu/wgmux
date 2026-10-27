@@ -6,21 +6,8 @@ import (
 	"testing"
 	"unsafe"
 
-	"github.com/tsuzu/wgmux/internal/config"
+	"github.com/tsuzu/wgmux/internal/api"
 )
-
-func mkConfig(t *testing.T) *config.Config {
-	t.Helper()
-	return &config.Config{
-		Peers: []config.Peer{
-			{Name: "site-a", ID: 1},
-			{Name: "site-b", ID: 2},
-		},
-		Prefixes: []config.Prefix{
-			{CIDR: "10.20.0.10/32", Candidates: []string{"site-a", "site-b"}, Active: "site-a", Policy: "active"},
-		},
-	}
-}
 
 // The BPF side (bpf/mux.c) depends on these exact sizes.
 func TestMapLayoutSizes(t *testing.T) {
@@ -73,7 +60,9 @@ func TestHashPickIsStable(t *testing.T) {
 // a byte-swapped key silently never matches (the containerlab e2e
 // caught exactly that).
 func TestSteeringKeyWireBytes(t *testing.T) {
-	entries, err := BuildEntries(mkConfig(t))
+	entries, err := EntriesFromSpec([]api.PrefixSpec{
+		{CIDR: "10.20.0.10/32", CandidateIDs: []uint32{1, 2}, ActiveID: 1, Policy: "active"},
+	})
 	if err != nil {
 		t.Fatal(err)
 	}

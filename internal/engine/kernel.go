@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/vishvananda/netlink"
+	"github.com/vishvananda/netns"
 	"golang.zx2c4.com/wireguard/wgctrl"
 	"golang.zx2c4.com/wireguard/wgctrl/wgtypes"
 
@@ -13,19 +14,41 @@ import (
 	"github.com/tsuzu/wgmux/internal/netnsutil"
 )
 
-type kernelEngine struct {
+// Context gives the kernel peer provisioner the namespace handles
+// of one built topology.
+type Context struct {
+	BackendNS     string
+	BackendHandle netns.NsHandle
+	Main          *netlink.Handle
+	Backend       *netlink.Handle
+	MTU           int
+}
+
+// peerRef points at a provisioned peer's device in the backend
+// namespace — the steering attachment point the BPF datapath needs.
+type peerRef struct {
+	DeviceName string
+	Ifindex    int
+}
+
+// kernelPeers provisions in-tree WireGuard devices inside one
+// backend namespace: a device per peer, created in the main
+// namespace (its UDP sockets' birth namespace) and moved into the
+// backend. It is the kernel mux engine's peer layer; steering is
+// the BPF datapath's job.
+type kernelPeers struct {
 	ctx   *Context
 	specs map[string]api.PeerSpec
 }
 
-func newKernel(ctx *Context) *kernelEngine {
-	return &kernelEngine{ctx: ctx, specs: map[string]api.PeerSpec{}}
+func newKernelPeers(ctx *Context) *kernelPeers {
+	return &kernelPeers{ctx: ctx, specs: map[string]api.PeerSpec{}}
 }
 
-func (e *kernelEngine) AddPeer(spec api.PeerSpec) (Ref, error) {
+func (e *kernelPeers) AddPeer(spec api.PeerSpec) (peerRef, error) {
 	name := DeviceName(spec.Name)
 	if len(name) >= 16 {
-		return Ref{}, fmt.Errorf("peer %q: device name %q exceeds IFNAMSIZ", spec.Name, name)
+		return peerRef{}, fmt.Errorf("peer %q: device name %q exceeds IFNAMSIZ", spec.Name, name)
 	}
 	main := e.ctx.Main
 	link, err := main.LinkByName(name)
@@ -35,29 +58,29 @@ func (e *kernelEngine) AddPeer(spec api.PeerSpec) (Ref, error) {
 			LinkType:  "wireguard",
 		}
 		if err := main.LinkAdd(gl); err != nil {
-			return Ref{}, fmt.Errorf("create %s: %w", name, err)
+			return peerRef{}, fmt.Errorf("create %s: %w", name, err)
 		}
 		link = gl
 	}
 	if err := e.configure(name, spec); err != nil {
-		return Ref{}, err
+		return peerRef{}, err
 	}
 	// Move to the backend; the UDP sockets keep main as birth namespace.
 	if err := main.LinkSetNsFd(link, int(e.ctx.BackendHandle)); err != nil {
-		return Ref{}, fmt.Errorf("move %s to backend: %w", name, err)
+		return peerRef{}, fmt.Errorf("move %s to backend: %w", name, err)
 	}
 	blink, err := e.ctx.Backend.LinkByName(name)
 	if err != nil {
-		return Ref{}, fmt.Errorf("find %s in backend: %w", name, err)
+		return peerRef{}, fmt.Errorf("find %s in backend: %w", name, err)
 	}
 	if err := e.ctx.Backend.LinkSetUp(blink); err != nil {
-		return Ref{}, fmt.Errorf("up %s: %w", name, err)
+		return peerRef{}, fmt.Errorf("up %s: %w", name, err)
 	}
 	e.specs[spec.Name] = spec
-	return Ref{DeviceName: name, Ifindex: blink.Attrs().Index}, nil
+	return peerRef{DeviceName: name, Ifindex: blink.Attrs().Index}, nil
 }
 
-func (e *kernelEngine) configure(name string, spec api.PeerSpec) error {
+func (e *kernelPeers) configure(name string, spec api.PeerSpec) error {
 	client, err := wgctrl.New()
 	if err != nil {
 		return fmt.Errorf("wgctrl: %w", err)
@@ -80,6 +103,13 @@ func (e *kernelEngine) configure(name string, spec api.PeerSpec) error {
 		PublicKey:         pub,
 		ReplaceAllowedIPs: true,
 		AllowedIPs:        allowed,
+	}
+	if spec.PresharedKey != "" {
+		psk, err := wgtypes.ParseKey(spec.PresharedKey)
+		if err != nil {
+			return fmt.Errorf("peer %q preshared key: %w", spec.Name, err)
+		}
+		pc.PresharedKey = &psk
 	}
 	if spec.Endpoint != "" {
 		udp, err := net.ResolveUDPAddr("udp", spec.Endpoint)
@@ -106,7 +136,7 @@ func (e *kernelEngine) configure(name string, spec api.PeerSpec) error {
 	return nil
 }
 
-func (e *kernelEngine) RemovePeer(name string) error {
+func (e *kernelPeers) RemovePeer(name string) error {
 	device := DeviceName(name)
 	link, err := e.ctx.Backend.LinkByName(device)
 	if err != nil {
@@ -120,7 +150,7 @@ func (e *kernelEngine) RemovePeer(name string) error {
 }
 
 // Peers reads device state from inside the backend namespace.
-func (e *kernelEngine) Peers() ([]api.PeerState, error) {
+func (e *kernelPeers) Peers() ([]api.PeerState, error) {
 	var out []api.PeerState
 	err := netnsutil.WithNetNS(e.ctx.BackendNS, func() error {
 		client, err := wgctrl.New()
@@ -137,11 +167,8 @@ func (e *kernelEngine) Peers() ([]api.PeerState, error) {
 			byDevice[d.Name] = d
 		}
 		for _, spec := range e.specs {
-			st := api.PeerState{Name: spec.Name, ID: spec.ID, Device: DeviceName(spec.Name)}
-			if link, err := e.ctx.Backend.LinkByName(st.Device); err == nil {
-				st.Ifindex = link.Attrs().Index
-			}
-			if dev, ok := byDevice[st.Device]; ok {
+			st := api.PeerState{Name: spec.Name, ID: spec.ID}
+			if dev, ok := byDevice[DeviceName(spec.Name)]; ok {
 				for _, p := range dev.Peers {
 					st.LastHandshake = p.LastHandshakeTime
 					st.BytesReceived += uint64(p.ReceiveBytes)
@@ -158,4 +185,4 @@ func (e *kernelEngine) Peers() ([]api.PeerState, error) {
 	return out, err
 }
 
-func (e *kernelEngine) Close() error { return nil }
+func (e *kernelPeers) Close() error { return nil }

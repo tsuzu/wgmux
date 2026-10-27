@@ -14,8 +14,8 @@ import (
 	"github.com/tsuzu/wgmux/internal/config"
 )
 
-// Run polls until stop is closed.
-func Run(cfg *config.Config, client *api.Client, stop <-chan struct{}, logger *log.Logger) {
+// Run polls the named mux instance until stop is closed.
+func Run(cfg *config.Mux, client *api.Client, stop <-chan struct{}, logger *log.Logger) {
 	if logger == nil {
 		logger = log.Default()
 	}
@@ -34,10 +34,10 @@ func Run(cfg *config.Config, client *api.Client, stop <-chan struct{}, logger *l
 }
 
 // EvaluateOnce performs a single failover evaluation pass.
-func EvaluateOnce(cfg *config.Config, client *api.Client) error {
+func EvaluateOnce(cfg *config.Mux, client *api.Client) error {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	st, err := client.State(ctx)
+	st, err := client.State(ctx, cfg.Name)
 	if err != nil {
 		return err
 	}
@@ -51,7 +51,7 @@ func EvaluateOnce(cfg *config.Config, client *api.Client) error {
 	}
 	maxAge := time.Duration(cfg.Failover.HandshakeMaxAge) * time.Second
 	now := time.Now()
-	for _, prefix := range cfg.Prefixes {
+	for _, prefix := range cfg.EffectivePrefixes {
 		if prefix.Policy != config.PolicyFailover {
 			continue
 		}
@@ -79,7 +79,7 @@ func EvaluateOnce(cfg *config.Config, client *api.Client) error {
 				continue
 			}
 			log.Printf("wgmux: failover %s: %s -> %s", prefix.CIDR, activePeer.Name, candName)
-			if err := client.SetActive(ctx, api.SetActiveRequest{CIDR: prefix.CIDR, PeerID: uint32(cand.ID)}); err != nil {
+			if err := client.SetActive(ctx, api.SetActiveRequest{Mux: cfg.Name, CIDR: prefix.CIDR, PeerID: uint32(cand.ID)}); err != nil {
 				return err
 			}
 			break
@@ -88,7 +88,7 @@ func EvaluateOnce(cfg *config.Config, client *api.Client) error {
 	return nil
 }
 
-func peerByID(cfg *config.Config, id uint32) *config.Peer {
+func peerByID(cfg *config.Mux, id uint32) *config.Peer {
 	for i := range cfg.Peers {
 		if uint32(cfg.Peers[i].ID) == id {
 			return &cfg.Peers[i]

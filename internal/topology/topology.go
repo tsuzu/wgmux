@@ -16,7 +16,6 @@ import (
 	"github.com/vishvananda/netlink"
 	"github.com/vishvananda/netns"
 
-	"github.com/tsuzu/wgmux/internal/api"
 	"github.com/tsuzu/wgmux/internal/config"
 	"github.com/tsuzu/wgmux/internal/datapath"
 	"github.com/tsuzu/wgmux/internal/netnsutil"
@@ -25,9 +24,23 @@ import (
 // BackName is the backend end of the interconnect pair.
 const BackName = "mux-b"
 
+// Params describes one mux instance's topology: the kernel engine
+// resolves it from its construction parameters plus the applied
+// front spec.
+type Params struct {
+	BackendNS      string
+	Interconnect   string // config.InterconnectVeth | config.InterconnectNetkit
+	FrontName      string
+	FrontAddress   string // CIDR
+	BackendAddress string // CIDR
+	MTU            int
+	ManageRoutes   bool
+	Prefixes       []string // steered prefix CIDRs, for the main-ns routes
+}
+
 // Topology holds the namespace handles for a built topology.
 type Topology struct {
-	spec    api.ApplySpec
+	p       Params
 	Main    *netlink.Handle
 	Backend *netlink.Handle
 	nsH     netns.NsHandle
@@ -35,7 +48,7 @@ type Topology struct {
 
 // Open creates the backend namespace and returns handles to both
 // namespaces.
-func Open(spec api.ApplySpec) (*Topology, error) {
+func Open(spec Params) (*Topology, error) {
 	main, err := netlink.NewHandle()
 	if err != nil {
 		return nil, err
@@ -63,8 +76,8 @@ func Open(spec api.ApplySpec) (*Topology, error) {
 		// prefixes, which the backend has no routes for).
 		err := netnsutil.WithNetNS(spec.BackendNS, func() error {
 			for path, val := range map[string]string{
-				"/proc/sys/net/ipv4/ip_forward":          "1",
-				"/proc/sys/net/ipv4/conf/all/rp_filter": "0",
+				"/proc/sys/net/ipv4/ip_forward":             "1",
+				"/proc/sys/net/ipv4/conf/all/rp_filter":     "0",
 				"/proc/sys/net/ipv4/conf/default/rp_filter": "0",
 			} {
 				if err := os.WriteFile(path, []byte(val), 0o644); err != nil {
@@ -79,7 +92,7 @@ func Open(spec api.ApplySpec) (*Topology, error) {
 			return nil, err
 		}
 	}
-	return &Topology{spec: spec, Main: main, Backend: backend, nsH: nsH}, nil
+	return &Topology{p: spec, Main: main, Backend: backend, nsH: nsH}, nil
 }
 
 // BackendHandle exposes the namespace handle (engines need it to move
@@ -89,7 +102,7 @@ func (t *Topology) BackendNsHandle() netns.NsHandle { return t.nsH }
 // BuildInterconnect creates the pair and fills the datapath Info with
 // everything except the peers (engines provide those separately).
 func (t *Topology) BuildInterconnect() (*datapath.Info, error) {
-	spec := t.spec
+	spec := t.p
 	mtu := spec.MTU
 	if mtu == 0 {
 		mtu = 1420
@@ -175,16 +188,16 @@ func (t *Topology) BuildInterconnect() (*datapath.Info, error) {
 // (gateway = the backend end's address): a single FIB lookup in the
 // main namespace, exactly as with a direct WireGuard device.
 func (t *Topology) AddRoutes() error {
-	front, err := t.Main.LinkByName(t.spec.FrontName)
+	front, err := t.Main.LinkByName(t.p.FrontName)
 	if err != nil {
 		return err
 	}
-	backendIP, _, err := net.ParseCIDR(t.spec.BackendAddress)
+	backendIP, _, err := net.ParseCIDR(t.p.BackendAddress)
 	if err != nil {
 		return err
 	}
-	for _, p := range t.spec.Prefixes {
-		_, dst, err := net.ParseCIDR(p.CIDR)
+	for _, cidr := range t.p.Prefixes {
+		_, dst, err := net.ParseCIDR(cidr)
 		if err != nil {
 			return err
 		}
@@ -194,7 +207,7 @@ func (t *Topology) AddRoutes() error {
 			Gw:        backendIP,
 		}
 		if err := t.Main.RouteReplace(route); err != nil {
-			return fmt.Errorf("route %s via front: %w", p.CIDR, err)
+			return fmt.Errorf("route %s via front: %w", cidr, err)
 		}
 	}
 	return nil
@@ -204,19 +217,19 @@ func (t *Topology) AddRoutes() error {
 // namespace (destroying every device inside it, including engine
 // peers that live there).
 func (t *Topology) Teardown() error {
-	if t.spec.ManageRoutes {
-		backendIP, _, _ := net.ParseCIDR(t.spec.BackendAddress)
-		for _, p := range t.spec.Prefixes {
-			_, dst, err := net.ParseCIDR(p.CIDR)
+	if t.p.ManageRoutes {
+		backendIP, _, _ := net.ParseCIDR(t.p.BackendAddress)
+		for _, cidr := range t.p.Prefixes {
+			_, dst, err := net.ParseCIDR(cidr)
 			if err == nil {
 				t.Main.RouteDel(&netlink.Route{Dst: dst, Gw: backendIP})
 			}
 		}
 	}
-	if front, err := t.Main.LinkByName(t.spec.FrontName); err == nil {
+	if front, err := t.Main.LinkByName(t.p.FrontName); err == nil {
 		t.Main.LinkDel(front)
 	}
-	err := netnsutil.DeleteNamed(t.spec.BackendNS)
+	err := netnsutil.DeleteNamed(t.p.BackendNS)
 	t.Backend.Close()
 	t.Main.Close()
 	t.nsH.Close()

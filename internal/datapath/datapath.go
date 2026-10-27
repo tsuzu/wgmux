@@ -24,7 +24,6 @@ import (
 	"github.com/vishvananda/netns"
 	"golang.org/x/sys/unix"
 
-	"github.com/tsuzu/wgmux/internal/api"
 	"github.com/tsuzu/wgmux/internal/config"
 	"github.com/tsuzu/wgmux/internal/netnsutil"
 	"github.com/tsuzu/wgmux/internal/steer"
@@ -93,11 +92,21 @@ func loadSpec(stackReturn bool, ownPeerID *uint32) (*ebpf.CollectionSpec, error)
 	return spec, nil
 }
 
+// Params are the kernel engine's construction parameters the
+// datapath needs. They are parameters of one mux instance, resolved
+// by the engine before Apply.
+type Params struct {
+	BackendNS    string
+	Interconnect string // config.InterconnectVeth | config.InterconnectNetkit
+	Attach       string // config.AttachTCX | config.AttachTC
+	PinDir       string
+}
+
 // Apply loads the programs, populates and pins the maps, and attaches
 // everything inside the backend namespace. entries are the resolved
 // steering decisions supplied by the control plane (via the daemon);
 // this package never decides policy itself.
-func Apply(spec api.ApplySpec, info Info, entries []steer.Entry) error {
+func Apply(spec Params, info Info, entries []steer.Entry) error {
 	l2 := spec.Interconnect == config.InterconnectVeth // stack_return: veth only
 	if err := os.MkdirAll(spec.PinDir, 0o755); err != nil {
 		return err
@@ -291,6 +300,32 @@ func OpenPinnedSteering(pinDir string) (*ebpf.Map, error) {
 		return nil, fmt.Errorf("open pinned steering map (is wgmux applied?): %w", err)
 	}
 	return m, nil
+}
+
+// DebugCounterNames names the debug map slots, in index order
+// (indices are defined in bpf/mux.c). The first three from_wg slots
+// after wg_entries are legacy diagnostics of the datapath's
+// development; they stay because the counters cost nothing.
+var DebugCounterNames = []string{
+	"front_entries", "front_framed", "front_strips", "front_last_len",
+	"front_last_word0", "front_after_len", "front_after_word0", "front_redirects",
+	"wg_entries", "wg_cfg_fail", "wg_grow_fail", "wg_store_fail", "wg_redirects",
+}
+
+// Counters reads the pinned debug map and returns the counters by
+// name — the form the engine reports in api.State.
+func Counters(pinDir string) (map[string]uint64, error) {
+	vals, err := DebugSnapshot(pinDir)
+	if err != nil {
+		return nil, err
+	}
+	out := make(map[string]uint64, len(DebugCounterNames))
+	for i, name := range DebugCounterNames {
+		if i < len(vals) {
+			out[name] = vals[i]
+		}
+	}
+	return out, nil
 }
 
 // DebugSnapshot reads the mux_from_front observability counters

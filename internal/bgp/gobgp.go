@@ -17,7 +17,7 @@ import (
 // GoBGPSource embeds a GoBGP server in the control-plane process and
 // translates its best-path table events into Decisions.
 type GoBGPSource struct {
-	cfg    *config.Config
+	cfg    *config.Mux
 	server *server.BgpServer
 }
 
@@ -75,7 +75,7 @@ func (s *GoBGPSource) Run(ctx context.Context, out chan<- Decision) error {
 // watch response: the table event carries best paths directly, each
 // with its NLRI and the neighbor it came from (SourceId). Pure, so it
 // can be unit-tested with fabricated responses.
-func decisionsFromWatch(cfg *config.Config, r *gobgpapi.WatchEventResponse) []Decision {
+func decisionsFromWatch(cfg *config.Mux, r *gobgpapi.WatchEventResponse) []Decision {
 	table := r.GetTable()
 	if table == nil {
 		return nil

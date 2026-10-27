@@ -19,7 +19,7 @@ import (
 // manage_routes=false. Polling `show ip bgp json` is the portable
 // first backend; the Decision contract is identical either way.
 type FRRSource struct {
-	cfg *config.Config
+	cfg *config.Mux
 	// Exec runs vtysh and returns stdout; overridable in tests.
 	Exec func(ctx context.Context) ([]byte, error)
 }
@@ -124,7 +124,7 @@ func isBest(p frrPath) bool {
 
 // ParseFRRBestPaths extracts (prefix, wg peer) decisions from vtysh
 // JSON output. Pure; unit-tested with fixtures.
-func ParseFRRBestPaths(cfg *config.Config, raw []byte) ([]Decision, error) {
+func ParseFRRBestPaths(cfg *config.Mux, raw []byte) ([]Decision, error) {
 	var top struct {
 		Routes map[string]json.RawMessage `json:"routes"`
 	}

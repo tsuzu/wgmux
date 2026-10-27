@@ -9,8 +9,8 @@ import (
 	"github.com/tsuzu/wgmux/internal/config"
 )
 
-func testCfg() *config.Config {
-	return &config.Config{
+func testCfg() *config.Mux {
+	return &config.Mux{
 		BGP: config.BGP{Neighbors: []config.BGPNeighbor{
 			{Address: "10.200.0.11", WgPeer: "site-a"},
 			{Address: "10.200.0.12", WgPeer: "site-b"},

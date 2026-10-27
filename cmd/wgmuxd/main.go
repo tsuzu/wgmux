@@ -1,11 +1,16 @@
-// Command wgmuxd is the wgmux data-plane daemon. It owns the kernel
-// state (namespaces, peer engines, eBPF steering) and serves the
-// control-plane API (internal/api) on a unix socket. It makes no
-// routing decisions of its own.
+// Command wgmuxd is the wgmux data-plane daemon. It hosts mux
+// instances (namespaces, engines, BPF programs and maps) and serves
+// the control-plane API (internal/api) on a unix socket. It makes
+// no routing decisions of its own.
 //
-// The daemon must keep running for the userspace (wireguard-go)
-// engine; with the kernel engine the datapath survives daemon exit,
-// and a restarted daemon re-adopts state on the next apply.
+// Daemon-startup configuration is only the control socket and the
+// BPF pin root: which engine an instance runs and how it is built
+// are per-instance creation parameters, not daemon settings.
+//
+// The daemon must keep running for userspace (wireguard-go)
+// instances; with the kernel engine an instance's datapath survives
+// daemon exit, and a restarted daemon re-adopts it on the next
+// apply to an instance of the same name and creation parameters.
 package main
 
 import (
@@ -23,6 +28,7 @@ import (
 
 func main() {
 	socket := flag.String("socket", "/run/wgmux/wgmuxd.sock", "control socket path")
+	pinRoot := flag.String("pin-root", "/sys/fs/bpf", "bpffs base; kernel instances pin under <pin-root>/wgmux/<mux>")
 	flag.Parse()
 
 	if err := os.MkdirAll(filepath.Dir(*socket), 0o755); err != nil {
@@ -44,7 +50,7 @@ func main() {
 		<-sigs
 		l.Close()
 	}()
-	if err := api.Serve(l, daemon.New()); err != nil {
+	if err := api.Serve(l, daemon.New(*pinRoot)); err != nil {
 		fmt.Println("wgmuxd: listener closed")
 	}
 	os.Remove(*socket)

@@ -44,7 +44,7 @@ type Source interface {
 }
 
 // NewSource builds the source configured by cfg.BGP.Mode.
-func NewSource(cfg *config.Config) (Source, error) {
+func NewSource(cfg *config.Mux) (Source, error) {
 	switch cfg.BGP.Mode {
 	case config.BGPModeGoBGP:
 		return &GoBGPSource{cfg: cfg}, nil
@@ -56,7 +56,7 @@ func NewSource(cfg *config.Config) (Source, error) {
 }
 
 // NeighborPeer maps a BGP neighbor IP to its wgmux peer name.
-func NeighborPeer(cfg *config.Config, neighborIP string) (string, bool) {
+func NeighborPeer(cfg *config.Mux, neighborIP string) (string, bool) {
 	for _, n := range cfg.BGP.Neighbors {
 		if n.Address == neighborIP {
 			return n.WgPeer, true
@@ -69,7 +69,7 @@ func NeighborPeer(cfg *config.Config, neighborIP string) (string, bool) {
 // data plane as SetActive calls. A Decision is valid only for a
 // prefix whose policy is bgp and whose candidates include the peer —
 // BGP can never steer a prefix somewhere the operator did not allow.
-func Run(ctx context.Context, cfg *config.Config, src Source, client *wgmuxapi.Client) error {
+func Run(ctx context.Context, cfg *config.Mux, src Source, client *wgmuxapi.Client) error {
 	decisions := make(chan Decision, 16)
 	errCh := make(chan error, 1)
 	go func() { errCh <- src.Run(ctx, decisions) }()
@@ -87,15 +87,15 @@ func Run(ctx context.Context, cfg *config.Config, src Source, client *wgmuxapi.C
 	}
 }
 
-func applyDecision(ctx context.Context, cfg *config.Config, client *wgmuxapi.Client, d Decision) error {
+func applyDecision(ctx context.Context, cfg *config.Mux, client *wgmuxapi.Client, d Decision) error {
 	_, ipnet, err := net.ParseCIDR(d.Prefix)
 	if err != nil {
 		return fmt.Errorf("decision for unparseable prefix %q ignored", d.Prefix)
 	}
 	var prefix *config.Prefix
-	for i := range cfg.Prefixes {
-		if cfg.Prefixes[i].CIDR == ipnet.String() {
-			prefix = &cfg.Prefixes[i]
+	for i := range cfg.EffectivePrefixes {
+		if cfg.EffectivePrefixes[i].CIDR == ipnet.String() {
+			prefix = &cfg.EffectivePrefixes[i]
 			break
 		}
 	}
@@ -119,5 +119,5 @@ func applyDecision(ctx context.Context, cfg *config.Config, client *wgmuxapi.Cli
 		return fmt.Errorf("decision names unknown peer %q", d.WgPeer)
 	}
 	log.Printf("wgmux bgp: %s best path now via %s", ipnet, d.WgPeer)
-	return client.SetActive(ctx, wgmuxapi.SetActiveRequest{CIDR: ipnet.String(), PeerID: uint32(peer.ID)})
+	return client.SetActive(ctx, wgmuxapi.SetActiveRequest{Mux: cfg.Name, CIDR: ipnet.String(), PeerID: uint32(peer.ID)})
 }
