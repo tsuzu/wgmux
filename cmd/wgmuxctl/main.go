@@ -1,7 +1,16 @@
-// Command wgmuxctl is the wgmux control plane. It owns the config
-// file and every selection policy (manual activation, handshake
-// failover, BGP), and drives the data plane (wgmuxd) exclusively
-// through internal/api. It never touches netlink or BPF itself.
+// Command wgmuxctl is the wgmux control plane. It drives the data
+// plane (wgmuxd) exclusively through internal/api and never touches
+// netlink or BPF itself.
+//
+// The basic use needs no config file at all — hand it the wg-quick
+// files you already have:
+//
+//	wgmuxctl apply site-a.conf site-b.conf
+//
+// and the two tunnels become one aggregated interface (wg-mux).
+// A YAML config (-c) is the optional overlay for policies
+// (failover/bgp/hash), several muxes in one file, or inline peers;
+// in YAML form a peer can reference a wg file with `wg_config:`.
 package main
 
 import (
@@ -11,15 +20,18 @@ import (
 	"net"
 	"os"
 	"os/signal"
+	"sort"
+	"strings"
 	"syscall"
 	"time"
 
 	"github.com/tsuzu/wgmux/internal/api"
 	"github.com/tsuzu/wgmux/internal/bgp"
 	"github.com/tsuzu/wgmux/internal/config"
-	"github.com/tsuzu/wgmux/internal/datapath"
 	"github.com/tsuzu/wgmux/internal/monitor"
 )
+
+const defaultSocket = "/run/wgmux/wgmuxd.sock"
 
 func main() {
 	if len(os.Args) < 2 {
@@ -34,6 +46,8 @@ func main() {
 		err = cmdDestroy(os.Args[2:])
 	case "status":
 		err = cmdStatus(os.Args[2:])
+	case "list":
+		err = cmdList(os.Args[2:])
 	case "activate":
 		err = cmdActivate(os.Args[2:])
 	case "monitor":
@@ -53,161 +67,487 @@ func main() {
 }
 
 func usage() {
-	fmt.Fprintln(os.Stderr, `usage: wgmuxctl <command> [flags]
+	fmt.Fprintln(os.Stderr, `usage: wgmuxctl <command> [flags] [args]
 
 commands:
-  apply     [-c config] [--monitor] [--bgp]  send desired state to wgmuxd
-  destroy   [-c config]                      tear the datapath down
-  status    [-c config]                      show peers and current selections
-  activate  [-c config] <cidr> <peer>        make peer the active selection for a prefix
-  monitor   [-c config]                      run the failover policy in the foreground
-  bgp       [-c config]                      run the BGP selection source in the foreground
-  validate  [-c config]                      check a config file only`)
+  apply     [flags] <wg.conf>...        aggregate wg-quick files into one mux
+  apply     -c config.yaml              apply the mux(es) from a YAML config
+  destroy   [-c config | -name mux]     tear mux instance(s) down
+  status    [-c config | -name mux]     show instances, peers and selections
+  list      [-socket path]              list the daemon's mux instances
+  activate  [-name mux] <cidr> <peer>   make peer the active selection for a prefix
+  monitor   -c config [-name mux]       run the failover policy in the foreground
+  bgp       -c config [-name mux]       run the BGP selection source in the foreground
+  validate  -c config | <wg.conf>...    check inputs only
+
+apply flags (direct wg-file mode):
+  -name wg-mux        instance name (= front interface name; default wg-mux)
+  -engine kernel      kernel | userspace        (creation parameter)
+  -interconnect veth  veth | netkit             (creation parameter, kernel only)
+  -attach tcx         tcx | tc                  (creation parameter, kernel only)
+  -backend-address A  interconnect backend address (creation parameter, kernel only)
+  -front-address A    override the front address derived from the conf files
+  -monitor, -bgp      also run the policy daemons in the foreground`)
 }
 
-func loadCfg(args []string, extra func(fs *flag.FlagSet)) (*config.Config, *flag.FlagSet, error) {
-	fs := flag.NewFlagSet("wgmuxctl", flag.ContinueOnError)
-	path := fs.String("c", "wgmux.yaml", "config file")
-	if extra != nil {
-		extra(fs)
+// commonFlags are the flags every config/daemon command shares.
+type commonFlags struct {
+	configPath *string
+	socket     *string
+	name       *string
+}
+
+func addCommon(fs *flag.FlagSet) *commonFlags {
+	return &commonFlags{
+		configPath: fs.String("c", "", "YAML config file"),
+		socket:     fs.String("socket", "", "wgmuxd socket (default: config's api_socket, else "+defaultSocket+")"),
+		name:       fs.String("name", "", "mux instance name"),
 	}
-	if err := fs.Parse(args); err != nil {
-		return nil, fs, err
+}
+
+func socketFor(cf *commonFlags, cfg *config.Config) string {
+	if *cf.socket != "" {
+		return *cf.socket
 	}
-	cfg, err := config.Load(*path)
+	if cfg != nil && cfg.APISocket != "" {
+		return cfg.APISocket
+	}
+	return defaultSocket
+}
+
+func clientFor(cf *commonFlags, cfg *config.Config) *api.Client {
+	return &api.Client{SocketPath: socketFor(cf, cfg)}
+}
+
+func loadYAML(cf *commonFlags) (*config.Config, error) {
+	if *cf.configPath == "" {
+		return nil, fmt.Errorf("this command needs -c <config.yaml>")
+	}
+	return config.Load(*cf.configPath)
+}
+
+// selectMuxes returns the config's muxes, or only the named one.
+func selectMuxes(cfg *config.Config, name string) ([]*config.Mux, error) {
+	if name == "" {
+		return cfg.Muxes, nil
+	}
+	m := cfg.MuxByName(name)
+	if m == nil {
+		return nil, fmt.Errorf("config has no mux named %q", name)
+	}
+	return []*config.Mux{m}, nil
+}
+
+func selectOneMux(cfg *config.Config, name string) (*config.Mux, error) {
+	muxes, err := selectMuxes(cfg, name)
 	if err != nil {
-		return nil, fs, err
+		return nil, err
 	}
-	return cfg, fs, nil
+	if len(muxes) != 1 {
+		return nil, fmt.Errorf("config defines %d muxes; select one with -name", len(muxes))
+	}
+	return muxes[0], nil
 }
 
-func clientFor(cfg *config.Config) *api.Client {
-	return &api.Client{SocketPath: cfg.APISocket}
+// ensureAndApply creates the instance if the daemon does not have
+// it yet (verifying creation-parameter immutability if it does),
+// then applies the desired state.
+func ensureAndApply(ctx context.Context, client *api.Client, mux *config.Mux, intent config.CreationSpec) error {
+	spec, err := buildSpec(mux)
+	if err != nil {
+		return err
+	}
+	infos, err := client.List(ctx)
+	if err != nil {
+		return err
+	}
+	exists := false
+	for _, info := range infos {
+		if info.Mux == mux.Name {
+			exists = true
+			if err := checkImmutable(info, intent); err != nil {
+				return err
+			}
+		}
+	}
+	if !exists {
+		if err := client.Create(ctx, buildCreate(mux)); err != nil {
+			return err
+		}
+	}
+	return client.Apply(ctx, mux.Name, spec)
 }
 
 func cmdApply(args []string) error {
-	var withMonitor, withBGP bool
-	cfg, _, err := loadCfg(args, func(fs *flag.FlagSet) {
-		fs.BoolVar(&withMonitor, "monitor", false, "also run the failover policy in the foreground")
-		fs.BoolVar(&withBGP, "bgp", false, "also run the BGP selection source in the foreground")
-	})
-	if err != nil {
+	fs := flag.NewFlagSet("apply", flag.ContinueOnError)
+	cf := addCommon(fs)
+	engine := fs.String("engine", "", "kernel | userspace (creation parameter)")
+	interconnect := fs.String("interconnect", "", "veth | netkit (creation parameter, kernel engine)")
+	attach := fs.String("attach", "", "tcx | tc (creation parameter, kernel engine)")
+	backendNS := fs.String("backend-ns", "", "backend namespace name (creation parameter, kernel engine)")
+	pinDir := fs.String("pin-dir", "", "BPF pin dir (creation parameter, kernel engine)")
+	backendAddr := fs.String("backend-address", "", "interconnect backend address (creation parameter, kernel engine)")
+	frontAddr := fs.String("front-address", "", "override the derived front address")
+	frontMTU := fs.Int("front-mtu", 0, "override the front MTU")
+	withMonitor := fs.Bool("monitor", false, "also run the failover policy in the foreground")
+	withBGP := fs.Bool("bgp", false, "also run the BGP selection source in the foreground")
+	if err := fs.Parse(args); err != nil {
 		return err
 	}
-	spec, err := buildSpec(cfg)
-	if err != nil {
-		return err
-	}
+	files := fs.Args()
 	ctx := context.Background()
-	if err := clientFor(cfg).Apply(ctx, spec); err != nil {
+
+	if len(files) > 0 {
+		// Direct mode: build the mux from the wg files themselves.
+		if *cf.configPath != "" {
+			return fmt.Errorf("give either -c <config.yaml> or wg .conf files, not both (in YAML mode, reference the files with wg_config: instead)")
+		}
+		mux, err := config.MuxFromWGFiles(*cf.name, files)
+		if err != nil {
+			return err
+		}
+		for _, w := range mux.Warnings {
+			fmt.Fprintf(os.Stderr, "wgmux: warning: %s\n", w)
+		}
+		intent := config.CreationSpec{}
+		visited := map[string]bool{}
+		fs.Visit(func(f *flag.Flag) { visited[f.Name] = true })
+		if visited["engine"] {
+			mux.Engine = *engine
+			intent.Engine, intent.EngineSet = *engine, true
+		}
+		if visited["interconnect"] {
+			mux.Kernel.Interconnect = *interconnect
+			intent.Interconnect, intent.InterconnectSet = *interconnect, true
+		}
+		if visited["attach"] {
+			mux.Kernel.Attach = *attach
+			intent.Attach, intent.AttachSet = *attach, true
+		}
+		if visited["backend-ns"] {
+			mux.Kernel.BackendNS = *backendNS
+			intent.BackendNS, intent.BackendNSSet = *backendNS, true
+		}
+		if visited["pin-dir"] {
+			mux.Kernel.PinDir = *pinDir
+			intent.PinDir, intent.PinDirSet = *pinDir, true
+		}
+		if visited["backend-address"] {
+			mux.Kernel.BackendAddress = *backendAddr
+			intent.BackendAddress, intent.BackendAddressSet = *backendAddr, true
+		}
+		if visited["front-address"] {
+			mux.Front.Address = *frontAddr
+		}
+		if visited["front-mtu"] {
+			mux.Front.MTU = *frontMTU
+		}
+		client := clientFor(cf, nil)
+		if err := ensureAndApply(ctx, client, mux, intent); err != nil {
+			return err
+		}
+		fmt.Printf("wgmuxctl: applied mux %s (engine=%s, %d peers, %d prefixes)\n",
+			mux.Name, mux.Engine, len(mux.Peers), len(mux.EffectivePrefixes))
+		if *withMonitor || *withBGP {
+			return runPolicies(mux, client, *withMonitor, *withBGP)
+		}
+		return nil
+	}
+
+	// YAML mode.
+	cfg, err := loadYAML(cf)
+	if err != nil {
+		return fmt.Errorf("no wg .conf files given: %w", err)
+	}
+	muxes, err := selectMuxes(cfg, *cf.name)
+	if err != nil {
 		return err
 	}
-	fmt.Printf("wgmuxctl: applied via wgmuxd (engine=%s, %d peers, interconnect=%s, attach=%s)\n",
-		spec.Engine, len(spec.Peers), spec.Interconnect, spec.Attach)
-	if withMonitor || withBGP {
-		return runPolicies(cfg, withMonitor, withBGP)
+	client := clientFor(cf, cfg)
+	for _, mux := range muxes {
+		if err := ensureAndApply(ctx, client, mux, mux.CreationSpec()); err != nil {
+			return err
+		}
+		fmt.Printf("wgmuxctl: applied mux %s (engine=%s, %d peers, %d prefixes)\n",
+			mux.Name, mux.Engine, len(mux.Peers), len(mux.EffectivePrefixes))
+	}
+	if *withMonitor || *withBGP {
+		mux, err := selectOneMux(cfg, *cf.name)
+		if err != nil {
+			return err
+		}
+		return runPolicies(mux, client, *withMonitor, *withBGP)
 	}
 	return nil
 }
 
 func cmdDestroy(args []string) error {
-	cfg, _, err := loadCfg(args, nil)
-	if err != nil {
+	fs := flag.NewFlagSet("destroy", flag.ContinueOnError)
+	cf := addCommon(fs)
+	if err := fs.Parse(args); err != nil {
 		return err
 	}
-	if err := clientFor(cfg).Destroy(context.Background()); err != nil {
-		return err
+	ctx := context.Background()
+	var cfg *config.Config
+	var targets []string
+	if *cf.configPath != "" {
+		var err error
+		cfg, err = loadYAML(cf)
+		if err != nil {
+			return err
+		}
+		muxes, err := selectMuxes(cfg, *cf.name)
+		if err != nil {
+			return err
+		}
+		for _, m := range muxes {
+			targets = append(targets, m.Name)
+		}
 	}
-	fmt.Println("wgmuxctl: destroyed")
+	client := clientFor(cf, cfg)
+	if len(targets) == 0 {
+		if *cf.name != "" {
+			targets = []string{*cf.name}
+		} else {
+			infos, err := client.List(ctx)
+			if err != nil {
+				return err
+			}
+			for _, info := range infos {
+				targets = append(targets, info.Mux)
+			}
+		}
+	}
+	var errs []error
+	for _, name := range targets {
+		if err := client.Destroy(ctx, name); err != nil {
+			errs = append(errs, err)
+			continue
+		}
+		fmt.Printf("wgmuxctl: destroyed mux %s\n", name)
+	}
+	if len(errs) > 0 {
+		return errs[0]
+	}
 	return nil
 }
 
 func cmdStatus(args []string) error {
-	cfg, _, err := loadCfg(args, nil)
+	fs := flag.NewFlagSet("status", flag.ContinueOnError)
+	cf := addCommon(fs)
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	ctx := context.Background()
+	var cfg *config.Config
+	if *cf.configPath != "" {
+		var err error
+		cfg, err = loadYAML(cf)
+		if err != nil {
+			return err
+		}
+	}
+	client := clientFor(cf, cfg)
+	var names []string
+	created := map[string]time.Time{}
+	infos, err := client.List(ctx)
 	if err != nil {
 		return err
 	}
-	st, err := clientFor(cfg).State(context.Background())
-	if err != nil {
-		return err
+	for _, info := range infos {
+		created[info.Mux] = info.CreatedAt
 	}
+	if cfg != nil {
+		muxes, err := selectMuxes(cfg, *cf.name)
+		if err != nil {
+			return err
+		}
+		for _, m := range muxes {
+			names = append(names, m.Name)
+		}
+	} else if *cf.name != "" {
+		names = []string{*cf.name}
+	} else {
+		for _, info := range infos {
+			names = append(names, info.Mux)
+		}
+	}
+	for _, name := range names {
+		st, err := client.State(ctx, name)
+		if err != nil {
+			return err
+		}
+		printState(st, created[name])
+	}
+	return nil
+}
+
+func printState(st api.State, createdAt time.Time) {
+	head := fmt.Sprintf("mux %s (engine %s", st.Mux, st.Engine)
+	if !createdAt.IsZero() {
+		head += ", created " + createdAt.Format(time.RFC3339)
+	}
+	fmt.Println(head + ")")
 	nameByID := map[uint32]string{}
-	for i := range cfg.Peers {
-		nameByID[uint32(cfg.Peers[i].ID)] = cfg.Peers[i].Name
+	for _, p := range st.Peers {
+		nameByID[p.ID] = p.Name
 	}
-	fmt.Printf("engine: %s\npeers:\n", st.Engine)
+	fmt.Println("  peers:")
 	for _, p := range st.Peers {
 		hs := "never"
 		if !p.LastHandshake.IsZero() {
 			hs = time.Since(p.LastHandshake).Round(time.Second).String() + " ago"
 		}
-		fmt.Printf("  %-16s dev %-16s ifindex %-3d handshake %-12s rx %d tx %d\n",
-			p.Name, p.Device, p.Ifindex, hs, p.BytesReceived, p.BytesSent)
-	}
-	fmt.Println("prefixes:")
-	for _, p := range st.Prefixes {
-		fmt.Printf("  %-18s policy %-6s active %s (candidates:", p.CIDR, p.Policy, nameByID[p.ActiveID])
-		for _, id := range p.CandidateIDs {
-			fmt.Printf(" %s", nameByID[id])
+		ep := p.Endpoint
+		if ep == "" {
+			ep = "-"
 		}
-		fmt.Println(")")
+		fmt.Printf("    %-16s handshake %-12s rx %-10d tx %-10d endpoint %s\n",
+			p.Name, hs, p.BytesReceived, p.BytesSent, ep)
 	}
-	if dbg, err := datapath.DebugSnapshot(cfg.PinDir); err == nil {
-		fmt.Printf("datapath: entries %d framed %d strips %d redirects %d last_len %d last_word0 %08x after_len %d after_word0 %08x\n",
-			dbg[0], dbg[1], dbg[2], dbg[7], dbg[3], dbg[4], dbg[5], dbg[6])
-		fmt.Printf("datapath-wg: entries %d cfg_fail %d grow_fail %d store_fail %d redirects %d\n",
-			dbg[8], dbg[9], dbg[10], dbg[11], dbg[12])
+	fmt.Println("  prefixes:")
+	for _, p := range st.Prefixes {
+		var cands []string
+		for _, id := range p.CandidateIDs {
+			cands = append(cands, nameByID[id])
+		}
+		fmt.Printf("    %-18s policy %-6s active %s (candidates: %s)\n",
+			p.CIDR, p.Policy, nameByID[p.ActiveID], strings.Join(cands, ", "))
+	}
+	if len(st.Counters) > 0 {
+		keys := make([]string, 0, len(st.Counters))
+		for k := range st.Counters {
+			keys = append(keys, k)
+		}
+		sort.Strings(keys)
+		fmt.Println("  counters:")
+		for _, k := range keys {
+			fmt.Printf("    %s %d\n", k, st.Counters[k])
+		}
+	}
+}
+
+func cmdList(args []string) error {
+	fs := flag.NewFlagSet("list", flag.ContinueOnError)
+	cf := addCommon(fs)
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	client := clientFor(cf, nil)
+	infos, err := client.List(context.Background())
+	if err != nil {
+		return err
+	}
+	for _, info := range infos {
+		line := fmt.Sprintf("%s\tengine=%s\tcreated=%s", info.Mux, info.Engine, info.CreatedAt.Format(time.RFC3339))
+		if info.Engine == api.EngineKernel {
+			line += fmt.Sprintf("\tinterconnect=%s attach=%s backend_ns=%s pin_dir=%s backend_address=%s",
+				info.Kernel.Interconnect, info.Kernel.Attach, info.Kernel.BackendNS, info.Kernel.PinDir, info.Kernel.BackendAddress)
+		}
+		fmt.Println(line)
 	}
 	return nil
 }
 
 func cmdActivate(args []string) error {
-	cfg, fs, err := loadCfg(args, nil)
-	if err != nil {
+	fs := flag.NewFlagSet("activate", flag.ContinueOnError)
+	cf := addCommon(fs)
+	if err := fs.Parse(args); err != nil {
 		return err
 	}
 	if fs.NArg() != 2 {
-		return fmt.Errorf("usage: wgmuxctl activate [-c config] <cidr> <peer>")
+		return fmt.Errorf("usage: wgmuxctl activate [-name mux] <cidr> <peer>")
 	}
 	if _, _, err := net.ParseCIDR(fs.Arg(0)); err != nil {
 		return err
 	}
-	peer := cfg.PeerByName(fs.Arg(1))
-	if peer == nil {
-		return fmt.Errorf("unknown peer %q", fs.Arg(1))
+	ctx := context.Background()
+	var cfg *config.Config
+	if *cf.configPath != "" {
+		var err error
+		cfg, err = loadYAML(cf)
+		if err != nil {
+			return err
+		}
 	}
-	err = clientFor(cfg).SetActive(context.Background(), api.SetActiveRequest{CIDR: fs.Arg(0), PeerID: uint32(peer.ID)})
+	client := clientFor(cf, cfg)
+	muxName := *cf.name
+	if muxName == "" && cfg != nil {
+		m, err := selectOneMux(cfg, "")
+		if err != nil {
+			return err
+		}
+		muxName = m.Name
+	}
+	if muxName == "" {
+		muxName = config.DefaultMuxName
+	}
+	// Resolve the peer name against the daemon's live state: this
+	// works the same whether the mux came from wg files or YAML.
+	st, err := client.State(ctx, muxName)
 	if err != nil {
 		return err
 	}
-	fmt.Printf("wgmuxctl: %s now selects %s\n", fs.Arg(0), peer.Name)
+	var peerID uint32
+	found := false
+	for _, p := range st.Peers {
+		if p.Name == fs.Arg(1) {
+			peerID, found = p.ID, true
+		}
+	}
+	if !found {
+		return fmt.Errorf("mux %q has no peer %q", muxName, fs.Arg(1))
+	}
+	if err := client.SetActive(ctx, api.SetActiveRequest{Mux: muxName, CIDR: fs.Arg(0), PeerID: peerID}); err != nil {
+		return err
+	}
+	fmt.Printf("wgmuxctl: mux %s: %s now selects %s\n", muxName, fs.Arg(0), fs.Arg(1))
 	return nil
 }
 
 func cmdMonitor(args []string) error {
-	cfg, _, err := loadCfg(args, nil)
+	fs := flag.NewFlagSet("monitor", flag.ContinueOnError)
+	cf := addCommon(fs)
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	cfg, err := loadYAML(cf)
 	if err != nil {
 		return err
 	}
-	return runPolicies(cfg, true, false)
+	mux, err := selectOneMux(cfg, *cf.name)
+	if err != nil {
+		return err
+	}
+	return runPolicies(mux, clientFor(cf, cfg), true, false)
 }
 
 func cmdBGP(args []string) error {
-	cfg, _, err := loadCfg(args, nil)
+	fs := flag.NewFlagSet("bgp", flag.ContinueOnError)
+	cf := addCommon(fs)
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	cfg, err := loadYAML(cf)
 	if err != nil {
 		return err
 	}
-	if cfg.BGP.Mode == config.BGPModeNone {
-		return fmt.Errorf("bgp.mode is none in this config")
+	mux, err := selectOneMux(cfg, *cf.name)
+	if err != nil {
+		return err
 	}
-	return runPolicies(cfg, false, true)
+	if mux.BGP.Mode == config.BGPModeNone {
+		return fmt.Errorf("mux %q: bgp.mode is none in this config", mux.Name)
+	}
+	return runPolicies(mux, clientFor(cf, cfg), false, true)
 }
 
 // runPolicies runs the long-lived control-plane decision makers
-// (failover monitor and/or BGP source) until interrupted. Both funnel
-// into api.SetActive; an arbiter is unnecessary because they own
-// disjoint prefix sets by policy (failover vs bgp prefixes).
-func runPolicies(cfg *config.Config, withMonitor, withBGP bool) error {
+// (failover monitor and/or BGP source) for one mux until
+// interrupted. Both funnel into api.SetActive; an arbiter is
+// unnecessary because they own disjoint prefix sets by policy
+// (failover vs bgp prefixes).
+func runPolicies(mux *config.Mux, client *api.Client, withMonitor, withBGP bool) error {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	sigs := make(chan os.Signal, 1)
@@ -216,7 +556,6 @@ func runPolicies(cfg *config.Config, withMonitor, withBGP bool) error {
 		<-sigs
 		cancel()
 	}()
-	client := clientFor(cfg)
 	errCh := make(chan error, 2)
 	if withMonitor {
 		stop := make(chan struct{})
@@ -225,20 +564,20 @@ func runPolicies(cfg *config.Config, withMonitor, withBGP bool) error {
 			close(stop)
 		}()
 		go func() {
-			monitor.Run(cfg, client, stop, nil)
+			monitor.Run(mux, client, stop, nil)
 			errCh <- nil
 		}()
-		fmt.Println("wgmuxctl: failover monitor running")
+		fmt.Printf("wgmuxctl: failover monitor running (mux %s)\n", mux.Name)
 	}
 	if withBGP {
-		src, err := bgp.NewSource(cfg)
+		src, err := bgp.NewSource(mux)
 		if err != nil {
 			return err
 		}
 		go func() {
-			errCh <- bgp.Run(ctx, cfg, src, client)
+			errCh <- bgp.Run(ctx, mux, src, client)
 		}()
-		fmt.Printf("wgmuxctl: BGP selection source running (mode %s)\n", cfg.BGP.Mode)
+		fmt.Printf("wgmuxctl: BGP selection source running (mux %s, mode %s)\n", mux.Name, mux.BGP.Mode)
 	}
 	select {
 	case <-ctx.Done():
@@ -249,14 +588,37 @@ func runPolicies(cfg *config.Config, withMonitor, withBGP bool) error {
 }
 
 func cmdValidate(args []string) error {
-	cfg, _, err := loadCfg(args, nil)
+	fs := flag.NewFlagSet("validate", flag.ContinueOnError)
+	cf := addCommon(fs)
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	files := fs.Args()
+	if len(files) > 0 {
+		mux, err := config.MuxFromWGFiles(*cf.name, files)
+		if err != nil {
+			return err
+		}
+		for _, w := range mux.Warnings {
+			fmt.Fprintf(os.Stderr, "wgmux: warning: %s\n", w)
+		}
+		if _, err := buildSpec(mux); err != nil {
+			return err
+		}
+		fmt.Printf("wgmuxctl: wg files OK (mux %s, %d peers, %d prefixes, front %s)\n",
+			mux.Name, len(mux.Peers), len(mux.EffectivePrefixes), mux.Front.Address)
+		return nil
+	}
+	cfg, err := loadYAML(cf)
 	if err != nil {
 		return err
 	}
-	if _, err := buildSpec(cfg); err != nil {
-		return err
+	for _, mux := range cfg.Muxes {
+		if _, err := buildSpec(mux); err != nil {
+			return err
+		}
+		fmt.Printf("wgmuxctl: mux %s OK (%d peers, %d prefixes, engine=%s, bgp=%s)\n",
+			mux.Name, len(mux.Peers), len(mux.EffectivePrefixes), mux.Engine, mux.BGP.Mode)
 	}
-	fmt.Printf("wgmuxctl: config OK (%d peers, %d prefixes, engine=%s, interconnect=%s, attach=%s, bgp=%s)\n",
-		len(cfg.Peers), len(cfg.Prefixes), cfg.Engine, cfg.Interconnect, cfg.Attach, cfg.BGP.Mode)
 	return nil
 }
