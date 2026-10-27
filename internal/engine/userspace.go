@@ -348,10 +348,12 @@ func (m *userspaceMux) closeLocked() error {
 	for _, p := range m.peers {
 		p.dev.Close()
 	}
+	// Route cleanup is best-effort only: the front link is deleted
+	// right below, which flushes its routes anyway, and a route the
+	// kernel no longer has (deleted externally, or an attribute
+	// mismatch on delete) must not fail the teardown.
 	for _, r := range m.routes {
-		if err := m.main.RouteDel(r); err != nil && firstErr == nil {
-			firstErr = err
-		}
+		m.main.RouteDel(r)
 	}
 	if link, err := m.main.LinkByName(m.frontName()); err == nil {
 		m.main.LinkDel(link)

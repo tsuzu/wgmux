@@ -1,12 +1,14 @@
 package engine
 
 import (
+	"errors"
 	"fmt"
 	"net"
 	"time"
 
 	"github.com/vishvananda/netlink"
 	"github.com/vishvananda/netns"
+	"golang.org/x/sys/unix"
 	"golang.zx2c4.com/wireguard/wgctrl"
 	"golang.zx2c4.com/wireguard/wgctrl/wgtypes"
 
@@ -39,6 +41,23 @@ type peerRef struct {
 type kernelPeers struct {
 	ctx   *Context
 	specs map[string]api.PeerSpec
+}
+
+// linkSetUpRetry sets a link up, retrying briefly on EADDRINUSE:
+// bringing a WireGuard device up binds its listen port, and on a
+// re-apply the PREVIOUS device with the same port may still be
+// inside the kernel's asynchronous namespace cleanup (cleanup_net
+// is a workqueue; the port frees when the old device's destructor
+// runs, typically within milliseconds).
+func linkSetUpRetry(h *netlink.Handle, link netlink.Link) error {
+	var err error
+	for i := 0; i < 50; i++ {
+		if err = h.LinkSetUp(link); err == nil || !errors.Is(err, unix.EADDRINUSE) {
+			return err
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	return err
 }
 
 func newKernelPeers(ctx *Context) *kernelPeers {
@@ -82,7 +101,7 @@ func (e *kernelPeers) AddPeer(spec api.PeerSpec) (peerRef, error) {
 	if err != nil {
 		return peerRef{}, fmt.Errorf("find %s in backend: %w", name, err)
 	}
-	if err := e.ctx.Backend.LinkSetUp(blink); err != nil {
+	if err := linkSetUpRetry(e.ctx.Backend, blink); err != nil {
 		return peerRef{}, fmt.Errorf("up %s: %w", name, err)
 	}
 	e.specs[spec.Name] = spec
