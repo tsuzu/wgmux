@@ -1,0 +1,12 @@
+[Unit]
+Description=wgmux (kernel engine)
+After=network-pre.target
+Wants=network-pre.target
+
+[Service]
+ExecStart=/usr/local/bin/wgmuxd -engine kernel -socket /run/wgmux/wgmuxd.sock \
+    -state-dir /var/lib/wgmux -pin-root /sys/fs/bpf -interconnect veth -attach tcx
+Restart=on-failure
+
+[Install]
+WantedBy=multi-user.target

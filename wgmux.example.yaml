@@ -1,78 +1,94 @@
-# wgmux example: one inner IP (10.20.0.10) reachable via two sites whose
-# networks overlap, plus a subnet shared by the same two sites.
+# wgmux example — the OPTIONAL YAML overlay. The basic case needs no
+# YAML at all:
 #
-# The main namespace ends up with exactly one new interface (wg-mux).
-# Both WireGuard devices live in the "wgmux" network namespace.
+#   wgmuxctl apply site-a.conf site-b.conf
+#
+# hands wgmuxd your existing wg-quick files and produces the same
+# result as the first mux below (peers derived from the files,
+# prefixes derived from their AllowedIPs, default policy "active"
+# with the first file active). Reach for YAML when you want
+# policies (failover / bgp / hash), several muxes in one file, or
+# inline peers. In YAML form a peer can still reference a wg-quick
+# file with wg_config: — the file is used as-is.
+#
+# wgmuxd must be running first; its startup flags choose the engine
+# kind and kernel shape for every instance it hosts, e.g.:
+#
+#   wgmuxd -engine kernel -interconnect veth -attach tcx \
+#          -socket /run/wgmux/wgmuxd.sock -state-dir /var/lib/wgmux
+#
+# (contrib/wgmuxd.service is a ready systemd unit.)
 
-front:
-  name: wg-mux
-  address: 10.200.0.2/24 # this host's tunnel identity
-  backend_address: 10.200.0.1/24
-  mtu: 1420
-
-backend_ns: wgmux
-
-# Data plane / control plane split:
-#   wgmuxd (daemon) owns the kernel state and serves api_socket.
-#   wgmuxctl (this config's owner) only sends it desired state and
-#   selection decisions. Start wgmuxd first, then use wgmuxctl.
 api_socket: /run/wgmux/wgmuxd.sock
 
-# Switchable axes:
-engine: kernel #       kernel (in-tree WireGuard) | userspace (wireguard-go)
-interconnect: veth #   veth | netkit (kernel >= 6.7)
-attach: tcx #          tcx  | tc (legacy clsact)
-# manage_routes: false # let FRR/zebra own the main-namespace routes instead
+muxes:
+  # --- Mux 1: two sites, both claiming the same inner IP, fed by
+  # --- the wg-quick files the operator already has.
+  - name: wg-mux # instance name == the front interface's name
+    # engine: kernel  # guard only: must match wgmuxd's -engine
+    # kernel:
+    #   interconnect: veth  # guard only: must match wgmuxd's -interconnect
+    #   attach: tcx         # guard only: must match wgmuxd's -attach
+    #   backend_address: 10.200.0.1/24  # the one creation parameter
+    peers:
+      - {name: site-a, wg_config: site-a.conf} # paths are relative to this file
+      - {name: site-b, wg_config: site-b.conf}
+    # front.address / MTU come from the files' [Interface] sections
+    # (they must agree); set them here to override.
+    # front: {address: 10.200.0.2/24, mtu: 1420}
+    # Prefixes are DERIVED from the peers' AllowedIPs; this list
+    # only overrides policy/active per CIDR.
+    prefixes:
+      - cidr: 10.20.0.10/32
+        policy: failover # active | hash | failover | bgp
+    failover:
+      handshake_max_age_seconds: 150
+      interval_seconds: 15
 
-identity:
-  private_key_file: /etc/wgmux/private.key
-
-peers:
-  - name: site-a
-    listen_port: 51820
-    public_key: "REPLACE_ME_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
-    endpoint: 203.0.113.10:51820
-    persistent_keepalive: 25
-  - name: site-b
-    listen_port: 51821
-    public_key: "REPLACE_ME_BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB="
-    endpoint: 203.0.113.11:51820
-    persistent_keepalive: 25
-
-prefixes:
-  # The same host IP exists behind both sites. Manual/failover choice.
-  - cidr: 10.20.0.10/32
-    candidates: [site-a, site-b]
-    active: site-a
-    policy: failover # active | hash | failover
-  # A whole overlapping subnet, spread per flow across both sites.
-  - cidr: 192.168.10.0/24
-    candidates: [site-a, site-b]
-    policy: hash
-  # A prefix whose active peer follows BGP best paths (needs bgp: below).
-  # - cidr: 172.16.0.0/24
-  #   candidates: [site-a, site-b]
-  #   policy: bgp
-
-failover:
-  handshake_max_age_seconds: 150
-  interval_seconds: 15
-
-# BGP as a selection source (policy: bgp prefixes). The BGP neighbor a
-# prefix's best path came from is mapped to a wgmux peer by IP.
-bgp:
-  mode: none # none | gobgp | frr
-  # --- gobgp (embedded in wgmuxctl) ---
-  # local_as: 65001
-  # router_id: 10.200.0.2
-  # listen_port: 179
-  # --- frr (external daemon, polled via vtysh) ---
-  # vtysh_path: vtysh
-  # poll_interval_seconds: 10
-  # neighbors:
-  #   - address: 10.200.0.11 # neighbor reached via site-a's tunnel
-  #     remote_as: 65011 #     (gobgp only)
-  #     wg_peer: site-a
-  #   - address: 10.200.0.12
-  #     remote_as: 65012
-  #     wg_peer: site-b
+  # --- Mux 2: a second aggregated NIC on the same daemon, with
+  # --- inline peers (no wg files). Its identity is its own, and it
+  # --- may steer the very same inner prefixes as mux 1 — instances
+  # --- are independent.
+  - name: wg-mux2
+    front:
+      address: 10.201.0.2/24 # this host's tunnel identity on mux 2
+    identity:
+      private_key_file: /etc/wgmux/mux2.key
+    peers:
+      - name: site-a
+        listen_port: 51830
+        public_key: "REPLACE_ME_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+        # preshared_key: "REPLACE_ME_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+        endpoint: 203.0.113.10:51820
+        persistent_keepalive: 25
+        allowed_ips: [10.20.0.10/32, 192.168.10.0/24]
+      - name: site-b
+        listen_port: 51831
+        public_key: "REPLACE_ME_BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB="
+        endpoint: 203.0.113.11:51820
+        persistent_keepalive: 25
+        allowed_ips: [10.20.0.10/32, 192.168.10.0/24]
+    prefixes:
+      # Overrides over the derived prefixes:
+      - cidr: 192.168.10.0/24
+        policy: hash # spread flows across both sites
+      # A prefix whose active peer follows BGP best paths:
+      # - cidr: 172.16.0.0/24
+      #   policy: bgp
+    # manage_routes: false # let FRR/zebra own the routes instead
+    bgp:
+      mode: none # none | gobgp | frr
+      # --- gobgp (embedded in wgmuxctl) ---
+      # local_as: 65001
+      # router_id: 10.201.0.2
+      # listen_port: 179
+      # --- frr (external daemon, polled via vtysh) ---
+      # vtysh_path: vtysh
+      # poll_interval_seconds: 10
+      # neighbors:
+      #   - address: 10.200.0.11 # neighbor reached via site-a's tunnel
+      #     remote_as: 65011 #     (gobgp only)
+      #     wg_peer: site-a
+      #   - address: 10.200.0.12
+      #     remote_as: 65012
+      #     wg_peer: site-b

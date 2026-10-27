@@ -147,3 +147,24 @@ per-instance constant (see below).
   loads are not permitted, so run
   `WGMUX_TEST_LOAD=1 go test ./internal/datapath/` on a normal host
   to have the kernel verifier check both programs and all maps.
+
+## Place in the engine model
+
+These programs are the **kernel engine's** realization of the
+steering contract (see `docs/design.md`). They are per-instance:
+each mux instance has its own backend namespace (`wgmux-<name>`),
+its own interconnect and peer devices, and its own copy of the
+maps/programs pinned under `<pin root>/wgmux/<name>/`. Two
+instances steering overlapping prefixes therefore have fully
+separate forwarding domains — which matters because in veth mode
+the return path uses the backend namespace's FIB, and that FIB is
+per-instance state like everything else here.
+
+The pins are also the persistence mechanism: because the steering
+state lives in pinned maps (not in the daemon), the kernel
+datapath keeps forwarding while wgmuxd is stopped, and a restarted
+daemon *adopts* the instance — it probes the namespace, the pin
+dir and the pinned steering map, and resumes `State`/`SetActive`
+against them without reprogramming anything. The userspace
+(wireguard-go) engine implements the same selection semantics in a
+Go pump (`internal/steer`); it uses none of this file's machinery.
