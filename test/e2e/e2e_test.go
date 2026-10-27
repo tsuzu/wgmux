@@ -183,8 +183,8 @@ func TestE2E(t *testing.T) {
 	l.setup()
 	defer l.teardown()
 
-	l.setupSite(siteANode, "site-a", siteOuterA, l.siteAPriv, muxPortFor(l, true, true), muxPortFor(l, false, true))
-	l.setupSite(siteBNode, "site-b", siteOuterB, l.siteBPriv, muxPortFor(l, true, false), muxPortFor(l, false, false))
+	l.setupSite(siteANode, "site-a", siteOuterA, l.siteAPriv, muxPortFor(l, true, true), muxPortFor(l, false, true), 4)
+	l.setupSite(siteBNode, "site-b", siteOuterB, l.siteBPriv, muxPortFor(l, true, false), muxPortFor(l, false, false), 6)
 	l.setupMux()
 
 	// === UX walkthrough: one daemon, two instances ===
@@ -342,7 +342,7 @@ func (l *lab) teardown() {
 // devices (wg0 → instance wg-mux, wg1 → instance wg-mux2), each
 // holding the SHARED inner IP, and a marker HTTP server on the
 // inner IP that answers with the site's name.
-func (l *lab) setupSite(node, name, outer string, priv wgtypes.Key, mux1Port, mux2Port int) {
+func (l *lab) setupSite(node, name, outer string, priv wgtypes.Key, mux1Port, mux2Port, pingEvery int) {
 	l.exec(node, fmt.Sprintf("ip addr add %s/24 dev eth1 && ip link set eth1 up", outer))
 	muxOuter := muxOuterA
 	if strings.HasSuffix(node, "siteb") {
@@ -363,8 +363,14 @@ func (l *lab) setupSite(node, name, outer string, priv wgtypes.Key, mux1Port, mu
 	l.exec(node, "mkdir -p /srv && printf '"+name+"\\n' > /srv/index.html")
 	l.execBg(node, "nohup python3 -m http.server 8080 --bind "+innerIP+" --directory /srv >/var/log/http.log 2>&1 &")
 	// Keep both tunnels warm so handshakes stay fresh: the failover
-	// monitor judges candidates by handshake age.
-	l.execBg(node, "nohup sh -c 'while true; do ping -c1 -W2 "+mux1Inner+" >/dev/null 2>&1; ping -c1 -W2 "+mux2Inner+" >/dev/null 2>&1; sleep 5; done' >/dev/null 2>&1 &")
+	// monitor judges candidates by handshake age. Only the SITES
+	// initiate periodically (the mux peers have no persistent
+	// keepalive), and the two sites use different periods (4s/6s):
+	// with keepalives on BOTH ends at the same period, simultaneous
+	// initiations can phase-lock and a pair's handshake never
+	// completes (observed in CI: rounds of crossed initiations every
+	// 5s, zero sessions). One-sided initiation cannot cross.
+	l.execBg(node, fmt.Sprintf("nohup sh -c 'while true; do ping -c1 -W2 "+mux1Inner+" >/dev/null 2>&1; ping -c1 -W2 "+mux2Inner+" >/dev/null 2>&1; sleep %d; done' >/dev/null 2>&1 &", pingEvery))
 }
 
 // wgConf renders one standard wg-quick file for a mux peer.
@@ -378,7 +384,6 @@ Address = %s/24
 PublicKey = %s
 Endpoint = %s
 AllowedIPs = %s/32
-PersistentKeepalive = 5
 `, priv.String(), listenPort, front, sitePub.String(), endpoint, innerIP)
 }
 
@@ -429,8 +434,16 @@ muxes:
 // is untouched). Re-applied instances may recreate the front link,
 // so this uses replace and is re-run after re-applies.
 func (l *lab) routeMux2() {
-	l.exec(muxNode, "ip rule add from "+mux2Inner+" lookup 202 2>/dev/null || true; "+
-		"ip route replace "+innerIP+"/32 dev wg-mux2 table 202")
+	route := "ip route replace " + innerIP + "/32 dev wg-mux2 table 202"
+	if l.daemonEngine == "kernel" {
+		// Same shape as the managed route: via the instance's
+		// backend address. A bare dev route on the veth front would
+		// make the stack ARP for the inner IP itself, which nothing
+		// answers (the interconnect is a point-to-point pair, not a
+		// LAN segment).
+		route = "ip route replace " + innerIP + "/32 via 10.201.0.1 dev wg-mux2 table 202"
+	}
+	l.exec(muxNode, "ip rule add from "+mux2Inner+" lookup 202 2>/dev/null || true; "+route)
 }
 
 // startDaemon (re)starts wgmuxd with this job's startup settings:
@@ -557,7 +570,7 @@ func (l *lab) diagnostics() {
 	l.diagExec(muxNode, "routes+rules+status",
 		"ip route; echo; ip rule; echo; ip route show table 202; echo; wgmuxctl status 2>&1")
 	l.diagExec(muxNode, "wg-mux backend (kernel engine only)",
-		"ip netns exec wgmux-wg-mux ip addr; echo; ip netns exec wgmux ip -s link; echo; ip netns exec wgmux wg show all")
+		"ip netns exec wgmux-wg-mux ip addr; echo; ip netns exec wgmux-wg-mux ip -s link; echo; ip netns exec wgmux-wg-mux wg show all")
 	l.diagExec(muxNode, "bpf pins",
 		"ls -la /sys/fs/bpf/wgmux/ /sys/fs/bpf/wgmux/wg-mux/ 2>&1; echo; ip netns exec wgmux-wg-mux tc filter show dev mux-b ingress 2>&1 | head -3")
 	l.diagExec(muxNode, "daemon log", "cat /var/log/wgmuxd.log")
