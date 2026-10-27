@@ -63,7 +63,7 @@ jobs:
             echo "===== $n ip addr ====="
             docker exec clab-wgmux-e2e-$n ip addr 2>/dev/null || true
             echo "===== $n ip netns / wg / logs ====="
-            docker exec clab-wgmux-e2e-$n sh -c 'ip netns list; wg show all 2>/dev/null; ip -n wgmux link 2>/dev/null; cat /var/log/wgmuxd.log /var/log/http.log 2>/dev/null' || true
+            docker exec clab-wgmux-e2e-$n sh -c 'ip netns list; wg show all 2>/dev/null; ip -n wgmux-wg-mux link 2>/dev/null; ls -la /var/lib/wgmux/instances/ 2>/dev/null; wgmuxctl list 2>/dev/null; wgmuxctl status 2>/dev/null; cat /var/log/wgmuxd.log /var/log/http.log /var/log/monitor.log 2>/dev/null' || true
           done
           sudo containerlab inspect -t test/e2e/topology.clab.yml || true
           sudo containerlab destroy -t test/e2e/topology.clab.yml --cleanup || true
