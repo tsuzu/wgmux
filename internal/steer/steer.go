@@ -1,31 +1,102 @@
 // Package steer holds the steering model shared by every datapath
-// realization: the entries that say which peers may carry a prefix
-// and how one is picked, plus the flow hash the kernel programs use.
-// The kernel engine programs these entries into BPF maps; the
-// userspace engine evaluates the same entries in Go (Table). Because
-// both use Entry/Pick/Hash, a prefix selects the same peer either
-// way.
+// realization. A prefix's selection (one peer, or several weighted
+// peers for ECMP) is compiled into a fixed-size hash-slot table:
+// slot[Hash(flow) & (Slots-1)] is the peer a NEW flow takes. The
+// kernel engine programs these tables into the BPF steering map; the
+// userspace engine evaluates the same tables in Go (Table). Because
+// both use Entry/Pick/Hash, a flow selects the same peer either way.
+//
+// BuildSlots is resilient: changing a selection moves only the slots
+// that must move (a removed peer's slots, or the minimum needed to
+// rebalance weights), so flows of unaffected peers keep their slot
+// even when they are not pinned.
 package steer
 
 import (
 	"encoding/binary"
-	"fmt"
 	"net"
-	"sort"
 	"sync"
 
 	"github.com/tsuzu/wgmux/internal/api"
 )
 
-// Policy codes as stored in the steering map (see bpf/mux.c) and in
-// Entry.Policy. The datapaths have no "failover": the control plane
-// implements it by rewriting the active index of a PolicyActive entry.
-const (
-	PolicyActive uint8 = 0
-	PolicyHash   uint8 = 1
-)
+// Slots is the number of hash slots per prefix (power of two; the
+// datapath masks with Slots-1). It bounds weight resolution: a
+// weighted selection is realized to the nearest 1/Slots.
+const Slots = 64
 
-const MaxCandidates = 4
+// NoPeer is the reserved peer ID meaning "no peer" (a slot holding it
+// drops the packet in both datapaths). Real peer IDs start at 1.
+const NoPeer uint32 = 0
+
+// SlotTable maps hash slots to peer IDs.
+type SlotTable [Slots]uint32
+
+// WeightedPeer is one selected peer in datapath-ID form.
+type WeightedPeer struct {
+	ID     uint32
+	Weight uint32 // 0 = 1
+}
+
+// BuildSlots compiles sel into a slot table. Target slot counts are
+// proportional to weights (largest-remainder rounding; ties broken by
+// position in sel, earlier first; every selected peer gets >= 1 slot
+// as long as len(sel) <= Slots). When prev is non-nil, slots already
+// owned by a peer that stays selected are kept, up to its new target
+// count (keeping the lowest-indexed ones); only freed slots are
+// reassigned, filled in ascending slot order to peers below target
+// in sel order. Deterministic. An empty sel yields an all-NoPeer table.
+func BuildSlots(prev *SlotTable, sel []WeightedPeer) SlotTable {
+	panic("steer.BuildSlots: implemented by the steer workstream")
+}
+
+// Share counts the slots each peer ID owns in t (NoPeer excluded).
+func (t SlotTable) Share() map[uint32]int {
+	out := map[uint32]int{}
+	for _, id := range t {
+		if id != NoPeer {
+			out[id]++
+		}
+	}
+	return out
+}
+
+// Entry is one steered prefix in datapath form.
+type Entry struct {
+	PrefixLen uint32
+	Addr      uint32 // wire representation, see WireAddr
+	Slots     SlotTable
+}
+
+// Key returns the entry's steering-map key.
+func (e Entry) Key() SteeringKey { return SteeringKey{PrefixLen: e.PrefixLen, Addr: e.Addr} }
+
+// Prefix returns the entry's prefix as a net.IPNet.
+func (e Entry) Prefix() *net.IPNet {
+	return &net.IPNet{
+		IP:   WireIP(e.Addr),
+		Mask: net.CIDRMask(int(e.PrefixLen), 32),
+	}
+}
+
+// KeyOf returns the steering key of a CIDR prefix.
+func KeyOf(prefix *net.IPNet) SteeringKey {
+	ones, _ := prefix.Mask.Size()
+	return SteeringKey{PrefixLen: uint32(ones), Addr: WireAddr(prefix.IP)}
+}
+
+// ToWeighted resolves an API selection (peer names) to datapath IDs.
+func ToWeighted(sel []api.PeerWeight, ids map[string]uint32) ([]WeightedPeer, error) {
+	panic("steer.ToWeighted: implemented by the steer workstream")
+}
+
+// EntriesFromSpec compiles every prefix's EffectiveSelection into an
+// Entry. ids maps peer name -> datapath ID. prev (may be nil) holds
+// the currently programmed tables by key; it is passed to BuildSlots
+// so an in-place re-apply moves as few slots as possible.
+func EntriesFromSpec(prefixes []api.PrefixSpec, ids map[string]uint32, prev map[SteeringKey]SlotTable) ([]Entry, error) {
+	panic("steer.EntriesFromSpec: implemented by the steer workstream")
+}
 
 // WireAddr returns an IPv4 address in the u32 representation the
 // BPF programs use. The programs copy iphdr fields verbatim with
@@ -44,65 +115,6 @@ func WireIP(w uint32) net.IP {
 	var b [4]byte
 	binary.LittleEndian.PutUint32(b[:], w)
 	return net.IPv4(b[0], b[1], b[2], b[3])
-}
-
-// Entry is one steering decision: the candidates for a prefix, which
-// one is active, and the selection policy.
-type Entry struct {
-	PrefixLen uint32
-	Addr      uint32 // wire representation, see WireAddr
-	PeerIDs   [MaxCandidates]uint32
-	Count     uint8
-	Active    uint8
-	Policy    uint8
-}
-
-// Prefix returns the entry's prefix as a net.IPNet.
-func (e Entry) Prefix() *net.IPNet {
-	return &net.IPNet{
-		IP:   WireIP(e.Addr),
-		Mask: net.CIDRMask(int(e.PrefixLen), 32),
-	}
-}
-
-// ActivePeer returns the currently selected peer ID for
-// policy=active entries.
-func (e Entry) ActivePeer() uint32 {
-	if int(e.Active) < int(e.Count) {
-		return e.PeerIDs[e.Active]
-	}
-	return e.PeerIDs[0]
-}
-
-// EntriesFromSpec resolves control-plane prefix specs into steering
-// entries. Decision policies arrive already normalised: "hash" runs
-// the hash policy, everything else ("active", and the control-plane
-// policies failover/bgp that drive SetActive) runs as active.
-func EntriesFromSpec(prefixes []api.PrefixSpec) ([]Entry, error) {
-	out := make([]Entry, 0, len(prefixes))
-	for _, p := range prefixes {
-		_, ipnet, err := net.ParseCIDR(p.CIDR)
-		if err != nil {
-			return nil, fmt.Errorf("prefix %s: %w", p.CIDR, err)
-		}
-		ones, _ := ipnet.Mask.Size()
-		e := Entry{PrefixLen: uint32(ones), Addr: WireAddr(ipnet.IP)}
-		for i, id := range p.CandidateIDs {
-			if i >= MaxCandidates {
-				return nil, fmt.Errorf("prefix %s: too many candidates", p.CIDR)
-			}
-			e.PeerIDs[i] = id
-			if id == p.ActiveID {
-				e.Active = uint8(i)
-			}
-		}
-		e.Count = uint8(len(p.CandidateIDs))
-		if p.Policy == "hash" {
-			e.Policy = PolicyHash
-		}
-		out = append(out, e)
-	}
-	return out, nil
 }
 
 // FlowKey mirrors struct flow_key in bpf/mux.c. Addresses and ports are in
@@ -150,25 +162,15 @@ func Hash(k FlowKey) uint32 {
 	return h
 }
 
-// Pick returns the candidate index the datapath would choose for a flow
-// that has no pinned flow entry yet.
-func (e Entry) Pick(k FlowKey) int {
-	if e.Count == 0 {
-		return -1
-	}
-	if e.Policy == PolicyHash {
-		return int(Hash(k) % uint32(e.Count))
-	}
-	if int(e.Active) < int(e.Count) {
-		return int(e.Active)
-	}
-	return 0
+// Pick returns the peer ID the datapath would choose for a flow that
+// has no (valid) pinned flow entry: Slots[Hash(k) & (Slots-1)].
+func (e Entry) Pick(k FlowKey) uint32 {
+	return e.Slots[Hash(k)&(Slots-1)]
 }
 
 // Table is the Go evaluation of a set of steering entries: a
-// longest-prefix-match lookup plus runtime activation changes. The
-// kernel engine programs the same entries into the BPF LPM trie
-// instead; both share Entry/Pick so selection semantics agree.
+// longest-prefix-match lookup plus runtime slot changes. The kernel
+// engine programs the same entries into the BPF LPM trie instead.
 type Table struct {
 	mu      sync.RWMutex
 	entries []Entry // sorted by PrefixLen, longest first
@@ -177,60 +179,26 @@ type Table struct {
 
 // NewTable builds a Table from entries (any order).
 func NewTable(entries []Entry) *Table {
-	es := make([]Entry, len(entries))
-	copy(es, entries)
-	sort.SliceStable(es, func(i, j int) bool { return es[i].PrefixLen > es[j].PrefixLen })
-	t := &Table{entries: es}
-	for _, e := range es {
-		t.nets = append(t.nets, e.Prefix())
-	}
-	return t
+	panic("steer.NewTable: implemented by the steer workstream")
 }
 
 // Lookup returns the entry governing dst (longest prefix match).
 func (t *Table) Lookup(dst net.IP) (Entry, bool) {
-	dst4 := dst.To4()
-	if dst4 == nil {
-		return Entry{}, false
-	}
-	t.mu.RLock()
-	defer t.mu.RUnlock()
-	for i, n := range t.nets {
-		if n.Contains(dst4) {
-			return t.entries[i], true
-		}
-	}
-	return Entry{}, false
+	panic("steer.Table.Lookup: implemented by the steer workstream")
 }
 
-// SetActive flips the active candidate of one prefix to peerID,
-// mirroring datapath.SetActive's semantics and errors.
-func (t *Table) SetActive(prefix *net.IPNet, peerID uint32) error {
-	ones, _ := prefix.Mask.Size()
-	addr := WireAddr(prefix.IP)
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	for i := range t.entries {
-		e := &t.entries[i]
-		if e.PrefixLen != uint32(ones) || e.Addr != addr {
-			continue
-		}
-		for j := 0; j < int(e.Count); j++ {
-			if e.PeerIDs[j] == peerID {
-				e.Active = uint8(j)
-				return nil
-			}
-		}
-		return fmt.Errorf("peer %d is not a candidate for prefix %s", peerID, prefix)
-	}
-	return fmt.Errorf("prefix %s not in steering table", prefix)
+// SetSlots replaces one existing prefix's slot table; error if the
+// prefix is not in the table.
+func (t *Table) SetSlots(key SteeringKey, slots SlotTable) error {
+	panic("steer.Table.SetSlots: implemented by the steer workstream")
+}
+
+// Replace swaps the whole entry set atomically (in-place re-apply).
+func (t *Table) Replace(entries []Entry) {
+	panic("steer.Table.Replace: implemented by the steer workstream")
 }
 
 // Entries returns a snapshot of the current entries.
 func (t *Table) Entries() []Entry {
-	t.mu.RLock()
-	defer t.mu.RUnlock()
-	out := make([]Entry, len(t.entries))
-	copy(out, t.entries)
-	return out
+	panic("steer.Table.Entries: implemented by the steer workstream")
 }

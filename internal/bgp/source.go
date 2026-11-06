@@ -119,5 +119,5 @@ func applyDecision(ctx context.Context, cfg *config.Mux, client *wgmuxapi.Client
 		return fmt.Errorf("decision names unknown peer %q", d.WgPeer)
 	}
 	log.Printf("wgmux bgp: %s best path now via %s", ipnet, d.WgPeer)
-	return client.SetActive(ctx, wgmuxapi.SetActiveRequest{Mux: cfg.Name, CIDR: ipnet.String(), PeerID: uint32(peer.ID)})
+	return client.SetSelection(ctx, wgmuxapi.SetSelectionRequest{Mux: cfg.Name, CIDR: ipnet.String(), Selection: []wgmuxapi.PeerWeight{{Peer: peer.Name}}})
 }

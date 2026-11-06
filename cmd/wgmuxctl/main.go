@@ -188,7 +188,7 @@ func ensureAndApply(ctx context.Context, client *api.Client, mux *config.Mux, in
 			return "", err
 		}
 	}
-	if err := client.Apply(ctx, mux.Name, spec); err != nil {
+	if err := client.Apply(ctx, api.ApplyRequest{Mux: mux.Name, Spec: spec}); err != nil {
 		return "", err
 	}
 	return dinfo.Engine, nil
@@ -422,12 +422,12 @@ func printState(st api.State, createdAt time.Time) {
 	}
 	fmt.Println("  prefixes:")
 	for _, p := range st.Prefixes {
-		var cands []string
-		for _, id := range p.CandidateIDs {
-			cands = append(cands, nameByID[id])
+		var sel []string
+		for _, w := range p.Selection {
+			sel = append(sel, fmt.Sprintf("%s:%d", w.Peer, w.EffectiveWeight()))
 		}
-		fmt.Printf("    %-18s policy %-6s active %s (candidates: %s)\n",
-			p.CIDR, p.Policy, nameByID[p.ActiveID], strings.Join(cands, ", "))
+		fmt.Printf("    %-18s mode %-6s policy %-8s selection %s (candidates: %s)\n",
+			p.CIDR, p.Mode, p.Policy, strings.Join(sel, ","), strings.Join(p.Candidates, ", "))
 	}
 	if len(st.Counters) > 0 {
 		keys := make([]string, 0, len(st.Counters))
@@ -505,17 +505,8 @@ func cmdActivate(args []string) error {
 	if err != nil {
 		return err
 	}
-	var peerID uint32
-	found := false
-	for _, p := range st.Peers {
-		if p.Name == fs.Arg(1) {
-			peerID, found = p.ID, true
-		}
-	}
-	if !found {
-		return fmt.Errorf("mux %q has no peer %q", muxName, fs.Arg(1))
-	}
-	if err := client.SetActive(ctx, api.SetActiveRequest{Mux: muxName, CIDR: fs.Arg(0), PeerID: peerID}); err != nil {
+	_ = st // TODO(control-plane workstream): activate/select/--flush
+	if err := client.SetSelection(ctx, api.SetSelectionRequest{Mux: muxName, CIDR: fs.Arg(0), Selection: []api.PeerWeight{{Peer: fs.Arg(1)}}}); err != nil {
 		return err
 	}
 	fmt.Printf("wgmuxctl: mux %s: %s now selects %s\n", muxName, fs.Arg(0), fs.Arg(1))

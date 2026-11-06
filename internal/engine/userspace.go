@@ -78,7 +78,7 @@ func (m *userspaceMux) Apply(spec api.ApplySpec) error {
 	if mtu == 0 {
 		mtu = 1420
 	}
-	entries, err := steer.EntriesFromSpec(spec.Prefixes)
+	entries, err := steer.EntriesFromSpec(spec.Prefixes, PeerIDs(spec), nil)
 	if err != nil {
 		return err
 	}
@@ -205,12 +205,11 @@ func (m *userspaceMux) forwardFromFront(pkt []byte, peers map[uint32]*userspaceP
 			m.counters.frontDrops.Add(1)
 			return
 		}
-		idx := entry.Pick(fk)
-		if idx < 0 {
+		peerID = entry.Pick(fk)
+		if peerID == steer.NoPeer {
 			m.counters.frontDrops.Add(1)
 			return
 		}
-		peerID = entry.PeerIDs[idx]
 		flows.put(fk, peerID)
 	}
 	p := peers[peerID]
@@ -282,49 +281,16 @@ func (m *userspaceMux) frontLoop(front tun.Device, peers map[uint32]*userspacePe
 	}
 }
 
-func (m *userspaceMux) SetActive(prefix *net.IPNet, peerID uint32) error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	if m.spec == nil {
-		return fmt.Errorf("mux %q: nothing applied", m.name)
-	}
-	return m.table.SetActive(prefix, peerID)
+func (m *userspaceMux) SetSelection(prefix *net.IPNet, sel []api.PeerWeight) error {
+	return errTODO // userspace engine workstream
+}
+
+func (m *userspaceMux) FlushPeer(peer string) error {
+	return errTODO // userspace engine workstream
 }
 
 func (m *userspaceMux) State() (api.State, error) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	st := api.State{Mux: m.name}
-	if m.spec == nil {
-		return st, fmt.Errorf("mux %q: nothing applied", m.name)
-	}
-	for _, pspec := range m.spec.Peers {
-		p := m.byName[pspec.Name]
-		pst := api.PeerState{Name: pspec.Name, ID: pspec.ID}
-		if p != nil {
-			dump, err := p.dev.IpcGet()
-			if err != nil {
-				return st, fmt.Errorf("ipcget %s: %w", pspec.Name, err)
-			}
-			parseUAPIState(dump, &pst)
-		}
-		st.Peers = append(st.Peers, pst)
-	}
-	for _, e := range m.table.Entries() {
-		pfx := e.Prefix()
-		ps := api.PrefixState{
-			CIDR:         pfx.String(),
-			ActiveID:     e.ActivePeer(),
-			Policy:       "active",
-			CandidateIDs: append([]uint32(nil), e.PeerIDs[:e.Count]...),
-		}
-		if e.Policy == steer.PolicyHash {
-			ps.Policy = "hash"
-		}
-		st.Prefixes = append(st.Prefixes, ps)
-	}
-	st.Counters = m.counters.snapshot()
-	return st, nil
+	return api.State{}, errTODO // userspace engine workstream
 }
 
 func (m *userspaceMux) Close() error {

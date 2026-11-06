@@ -160,7 +160,7 @@ func (m *kernelMux) Apply(spec api.ApplySpec) error {
 		info.PeerIfindex[peer.ID] = ref.Ifindex
 		info.PeerDevice[peer.ID] = ref.DeviceName
 	}
-	entries, err := steer.EntriesFromSpec(spec.Prefixes)
+	entries, err := steer.EntriesFromSpec(spec.Prefixes, PeerIDs(spec), nil)
 	if err != nil {
 		return fail(err)
 	}
@@ -200,13 +200,12 @@ func (m *kernelMux) teardownLocked() error {
 	return firstErr
 }
 
-func (m *kernelMux) SetActive(prefix *net.IPNet, peerID uint32) error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	if m.spec == nil {
-		return fmt.Errorf("mux %q: nothing applied", m.name)
-	}
-	return datapath.SetActive(m.kp.PinDir, prefix, peerID)
+func (m *kernelMux) SetSelection(prefix *net.IPNet, sel []api.PeerWeight) error {
+	return errTODO // kernel engine workstream
+}
+
+func (m *kernelMux) FlushPeer(peer string) error {
+	return errTODO // kernel engine workstream
 }
 
 func (m *kernelMux) State() (api.State, error) {
@@ -221,28 +220,11 @@ func (m *kernelMux) State() (api.State, error) {
 		return st, err
 	}
 	st.Peers = peers
-	snap, err := datapath.SteeringSnapshot(m.kp.PinDir)
-	if err != nil {
-		return st, err
-	}
 	for _, p := range m.spec.Prefixes {
-		ps := api.PrefixState{CIDR: p.CIDR, CandidateIDs: p.CandidateIDs, ActiveID: p.ActiveID, Policy: p.Policy}
-		_, ipnet, err := net.ParseCIDR(p.CIDR)
-		if err == nil {
-			ones, _ := ipnet.Mask.Size()
-			key := steer.SteeringKey{PrefixLen: uint32(ones), Addr: steer.WireAddr(ipnet.IP)}
-			if val, ok := snap[key]; ok {
-				if int(val.Active) < len(val.PeerIDs) {
-					ps.ActiveID = val.PeerIDs[val.Active]
-				}
-				if val.Policy == steer.PolicyHash {
-					ps.Policy = "hash"
-				} else {
-					ps.Policy = "active"
-				}
-			}
-		}
-		st.Prefixes = append(st.Prefixes, ps)
+		st.Prefixes = append(st.Prefixes, api.PrefixState{
+			CIDR: p.CIDR, Candidates: p.Candidates, Mode: p.EffectiveMode(),
+			Policy: p.Policy, Selection: p.EffectiveSelection(),
+		}) // TODO(kernel workstream): Slots from datapath.SteeringSnapshot
 	}
 	if counters, err := datapath.Counters(m.kp.PinDir); err == nil {
 		st.Counters = counters

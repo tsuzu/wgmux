@@ -13,7 +13,6 @@ import (
 	_ "embed"
 	"errors"
 	"fmt"
-	"net"
 	"os"
 	"path/filepath"
 	"strings"
@@ -213,10 +212,6 @@ func Apply(spec Params, info Info, entries []steer.Entry) error {
 	})
 }
 
-func addrBE(ip net.IP) uint32 {
-	return steer.WireAddr(ip)
-}
-
 // loadErr enriches a collection load failure with the tail of the
 // kernel verifier log, which is where the actual reason lives.
 func loadErr(what string, err error) error {
@@ -275,7 +270,7 @@ func backendHandle(nsName string) (*netlink.Handle, error) {
 
 func populate(info Info, entries []steer.Entry, maps map[string]*ebpf.Map) error {
 	for _, e := range entries {
-		if err := maps[MapSteering].Put(e.MapKey(), e.MapVal()); err != nil {
+		if err := maps[MapSteering].Put(e.Key(), e.MapVal()); err != nil {
 			return fmt.Errorf("put steering entry: %w", err)
 		}
 	}
@@ -345,55 +340,35 @@ func DebugSnapshot(pinDir string) ([]uint64, error) {
 	return out, nil
 }
 
-// SetActive flips the active candidate of one prefix in the pinned
-// steering map. peerID identifies the candidate by its position in the
-// entry's PeerIDs, so this works without the config file.
-func SetActive(pinDir string, prefix *net.IPNet, peerID uint32) error {
-	ones, _ := prefix.Mask.Size()
-	key := steer.SteeringKey{
-		PrefixLen: uint32(ones),
-		Addr:      addrBE(prefix.IP),
-	}
-	m, err := OpenPinnedSteering(pinDir)
-	if err != nil {
-		return err
-	}
-	defer m.Close()
-	var val steer.SteeringVal
-	if err := m.Lookup(key, &val); err != nil {
-		return fmt.Errorf("prefix %s not in steering map: %w", prefix, err)
-	}
-	for i := 0; i < int(val.Count) && i < len(val.PeerIDs); i++ {
-		if val.PeerIDs[i] == peerID {
-			val.Active = uint8(i)
-			if err := m.Put(key, val); err != nil {
-				return fmt.Errorf("update steering map: %w", err)
-			}
-			return nil
-		}
-	}
-	return fmt.Errorf("peer %d is not a candidate for prefix %s", peerID, prefix)
+// ---- v2 runtime API (implemented by the datapath workstream) ----
+
+var errTODO = errors.New("datapath v2: implemented by the datapath workstream")
+
+// ReplaceSteering makes the pinned steering map hold exactly
+// entries: puts every entry, then deletes keys not in entries. Used
+// by the kernel engine's in-place re-apply (no program reload).
+func ReplaceSteering(pinDir string, entries []steer.Entry) error { return errTODO }
+
+// SetSlots overwrites one existing prefix's slot table; error if the
+// key is not in the map.
+func SetSlots(pinDir string, key steer.SteeringKey, slots steer.SlotTable) error {
+	return errTODO
 }
 
-// SteeringSnapshot reads all steering entries (for status display).
-func SteeringSnapshot(pinDir string) (map[steer.SteeringKey]steer.SteeringVal, error) {
-	m, err := OpenPinnedSteering(pinDir)
-	if err != nil {
-		return nil, err
-	}
-	defer m.Close()
-	out := map[steer.SteeringKey]steer.SteeringVal{}
-	var key steer.SteeringKey
-	var val steer.SteeringVal
-	it := m.Iterate()
-	for it.Next(&key, &val) {
-		out[key] = val
-	}
-	if err := it.Err(); err != nil {
-		return nil, err
-	}
-	return out, nil
+// BumpPeerGen increments peer_dev[peerID].Gen, invalidating every
+// flow pin to that peer (FlushPeer).
+func BumpPeerGen(pinDir string, peerID uint32) error { return errTODO }
+
+// SteeringSnapshot reads all steering entries.
+func SteeringSnapshot(pinDir string) (map[steer.SteeringKey]steer.SlotTable, error) {
+	return nil, errTODO
 }
+
+// SetSpecHash writes runtime_cfg[0].SpecHash (0 = apply in progress).
+func SetSpecHash(pinDir string, h uint64) error { return errTODO }
+
+// SpecHash reads runtime_cfg[0].SpecHash.
+func SpecHash(pinDir string) (uint64, error) { return 0, errTODO }
 
 // Unpin removes pinned maps and links created by Apply.
 func Unpin(pinDir string) error {

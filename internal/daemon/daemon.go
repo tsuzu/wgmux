@@ -17,7 +17,6 @@ package daemon
 
 import (
 	"fmt"
-	"net"
 	"sort"
 	"sync"
 	"time"
@@ -289,23 +288,14 @@ func (d *Daemon) Destroy(req api.MuxRequest) error {
 	return closeErr
 }
 
-// SetActive is the decision point every control-plane policy uses.
-func (d *Daemon) SetActive(req api.SetActiveRequest) error {
-	d.mu.Lock()
-	defer d.mu.Unlock()
-	inst, err := d.get(req.Mux)
-	if err != nil {
-		return err
-	}
-	eng, err := d.live(inst)
-	if err != nil {
-		return err
-	}
-	_, ipnet, err := net.ParseCIDR(req.CIDR)
-	if err != nil {
-		return err
-	}
-	return eng.SetActive(ipnet, req.PeerID)
+// SetSelection is the decision point every control-plane policy uses.
+func (d *Daemon) SetSelection(req api.SetSelectionRequest) error {
+	return fmt.Errorf("daemon v2: SetSelection not implemented yet") // daemon workstream
+}
+
+// FlushPeer invalidates every flow pin to one peer.
+func (d *Daemon) FlushPeer(req api.FlushPeerRequest) error {
+	return fmt.Errorf("daemon v2: FlushPeer not implemented yet") // daemon workstream
 }
 
 func (d *Daemon) State(req api.MuxRequest) (api.State, error) {

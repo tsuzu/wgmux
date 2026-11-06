@@ -60,16 +60,12 @@ func buildSpec(mux *config.Mux) (api.ApplySpec, error) {
 		spec.Peers = append(spec.Peers, ps)
 	}
 	for _, prefix := range mux.EffectivePrefixes {
-		pfx := api.PrefixSpec{CIDR: prefix.CIDR, Policy: "active"}
+		// TODO(control-plane workstream): mode/policy/weights from config.
+		pfx := api.PrefixSpec{CIDR: prefix.CIDR, Candidates: prefix.Candidates, Mode: api.ModeSingle, Policy: api.PolicyStatic}
 		if prefix.Policy == config.PolicyHash {
-			pfx.Policy = "hash"
-		}
-		for _, name := range prefix.Candidates {
-			p := mux.PeerByName(name)
-			pfx.CandidateIDs = append(pfx.CandidateIDs, uint32(p.ID))
-			if name == prefix.Active {
-				pfx.ActiveID = uint32(p.ID)
-			}
+			pfx.Mode = api.ModeECMP
+		} else {
+			pfx.Selection = []api.PeerWeight{{Peer: prefix.Active, Weight: 1}}
 		}
 		spec.Prefixes = append(spec.Prefixes, pfx)
 	}
