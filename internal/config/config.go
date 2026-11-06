@@ -42,12 +42,6 @@ const (
 	PolicyStatic   = "static"
 	PolicyFailover = "failover"
 	PolicyBGP      = "bgp"
-	// Legacy policy spellings, still accepted: "active" is
-	// static+single, "hash" is static+ecmp. They are normalized
-	// away at load time; EffectivePrefixes never carry them.
-	PolicyActive = "active"
-	PolicyHash   = "hash"
-
 	// Prefix modes: how many candidates carry the prefix at once.
 	ModeSingle = "single"
 	ModeECMP   = "ecmp"
@@ -71,22 +65,12 @@ const (
 	DefaultMuxName = "wg-mux"
 )
 
-// KernelOptions carries the one kernel creation parameter a mux
-// config may set — the backend-address override — plus two GUARD
-// fields: interconnect/attach are daemon-startup settings
-// (wgmuxd -interconnect/-attach), and a config that names them is
-// asserting what the daemon must be running; wgmuxctl checks them
-// against the daemon and refuses a mismatch rather than silently
-// building a different datapath than the config describes.
-// backend_ns / pin_dir remain parseable only to warn: both are
-// derived from the mux name (and the daemon's pin root) and are
-// never configured.
+// KernelOptions carries the kernel engine's per-instance creation
+// parameter: the backend-address override. Everything else about the
+// kernel shape (interconnect, attach mode, namespace, pin dir) is a
+// wgmuxd startup setting or derived from the mux name.
 type KernelOptions struct {
 	BackendAddress string `yaml:"backend_address"`
-	Interconnect   string `yaml:"interconnect"` // guard: must match the daemon's
-	Attach         string `yaml:"attach"`       // guard: must match the daemon's
-	BackendNS      string `yaml:"backend_ns"`   // deprecated: derived, ignored with a warning
-	PinDir         string `yaml:"pin_dir"`      // deprecated: derived, ignored with a warning
 }
 
 // Front is the mux's one visible interface. Its name is the mux
@@ -149,8 +133,7 @@ type Peer struct {
 }
 
 // Allowed returns the peer's resolved AllowedIPs (normalized CIDR
-// strings) — from its wg_config or inline declaration, or derived
-// from the effective prefixes for the legacy inline form.
+// strings) — from its wg_config or inline declaration.
 func (p *Peer) Allowed() []string { return p.allowed }
 
 type Prefix struct {
@@ -163,8 +146,7 @@ type Prefix struct {
 	// the selected candidates in proportion to their weights.
 	Mode string `yaml:"mode"`
 	// Policy: static | failover | bgp (default static) — who changes
-	// the selection at runtime. Legacy: active = static+single,
-	// hash = static+ecmp.
+	// the selection at runtime.
 	Policy string `yaml:"policy"`
 	// Active names the initially selected candidate (mode single
 	// only). Defaults to the first candidate.
@@ -197,28 +179,15 @@ func (p Prefix) Selection() []api.PeerWeight {
 	return out
 }
 
-// normalizeModePolicy maps the legacy policy spellings and applies
-// the mode/policy defaults. It does not look at candidates.
-func (p *Prefix) normalizeModePolicy() error {
-	implied := ""
-	switch p.Policy {
-	case PolicyActive:
-		p.Policy, implied = PolicyStatic, ModeSingle
-	case PolicyHash:
-		p.Policy, implied = PolicyStatic, ModeECMP
-	case "":
+// normalizeModePolicy applies the mode/policy defaults. It does not
+// look at candidates.
+func (p *Prefix) normalizeModePolicy() {
+	if p.Policy == "" {
 		p.Policy = PolicyStatic
-	}
-	if implied != "" && p.Mode != "" && p.Mode != implied {
-		return fmt.Errorf("legacy policy implies mode %s but mode is %s", implied, p.Mode)
-	}
-	if p.Mode == "" {
-		p.Mode = implied
 	}
 	if p.Mode == "" {
 		p.Mode = ModeSingle
 	}
-	return nil
 }
 
 type Failover struct {
@@ -261,10 +230,6 @@ type Mux struct {
 	// Name is the instance name in wgmuxd AND the front interface's
 	// name. Defaults to DefaultMuxName.
 	Name string `yaml:"name"`
-	// Engine is the creation parameter selecting the datapath
-	// implementation: "kernel" (in-tree WireGuard) or "userspace"
-	// (wireguard-go). Fixed for the instance's lifetime.
-	Engine string `yaml:"engine"`
 	// Kernel holds the kernel engine's creation parameters.
 	Kernel KernelOptions `yaml:"kernel"`
 
@@ -273,8 +238,6 @@ type Mux struct {
 	Peers    []Peer   `yaml:"peers"`
 	// Prefixes are OVERRIDES over the prefixes derived from the
 	// peers' AllowedIPs (subset of candidates, active, policy).
-	// In the legacy inline form (no peer declares AllowedIPs) they
-	// are the full prefix definitions instead.
 	Prefixes []Prefix `yaml:"prefixes"`
 	Failover Failover `yaml:"failover"`
 	BGP      BGP      `yaml:"bgp"`
@@ -288,31 +251,14 @@ type Mux struct {
 	EffectivePrefixes []Prefix `yaml:"-"`
 	Warnings          []string `yaml:"-"`
 
-	dir       string
-	specified creationSpecified
+	dir string
 }
 
-// creationSpecified records which creation/guard fields were
-// explicitly present in the source (YAML fields / CLI flags), as
-// opposed to defaulted — the control plane uses it to check an
-// apply against the daemon's startup configuration and an existing
-// instance's immutable creation parameters without flagging values
-// the user never mentioned.
-type creationSpecified struct {
-	engine, interconnect, attach, backendAddr bool
-}
-
-// CreationSpec is a mux's creation intent: the engine kind and
-// kernel shape it assumes (guards against the daemon's startup
-// configuration) and its one true creation parameter, the
-// backend-address override — each with a presence flag.
+// CreationSpec is a mux's creation intent: the one per-instance
+// creation parameter, the backend-address override, with a presence
+// flag so an unspecified value is never compared against an existing
+// instance.
 type CreationSpec struct {
-	Engine            string
-	EngineSet         bool
-	Interconnect      string
-	InterconnectSet   bool
-	Attach            string
-	AttachSet         bool
 	BackendAddress    string
 	BackendAddressSet bool
 }
@@ -320,21 +266,8 @@ type CreationSpec struct {
 // CreationSpec reports the mux's creation intent.
 func (m *Mux) CreationSpec() CreationSpec {
 	return CreationSpec{
-		Engine: m.Engine, EngineSet: m.specified.engine,
-		Interconnect: m.Kernel.Interconnect, InterconnectSet: m.specified.interconnect,
-		Attach: m.Kernel.Attach, AttachSet: m.specified.attach,
-		BackendAddress: m.Kernel.BackendAddress, BackendAddressSet: m.specified.backendAddr,
-	}
-}
-
-// captureSpecified snapshots which creation fields are explicitly
-// set. Must run before finalize applies defaults.
-func (m *Mux) captureSpecified() {
-	m.specified = creationSpecified{
-		engine:       m.Engine != "",
-		interconnect: m.Kernel.Interconnect != "",
-		attach:       m.Kernel.Attach != "",
-		backendAddr:  m.Kernel.BackendAddress != "",
+		BackendAddress:    m.Kernel.BackendAddress,
+		BackendAddressSet: m.Kernel.BackendAddress != "",
 	}
 }
 
@@ -361,41 +294,6 @@ func (c *Config) MuxByName(name string) *Mux {
 	return nil
 }
 
-// fileConfig is the on-disk YAML shape: either a `muxes:` list, or
-// the legacy single-mux shorthand where the whole document is one
-// mux (with the old flat kernel fields, mapped into the mux's
-// kernel options).
-type fileConfig struct {
-	APISocket string `yaml:"api_socket"`
-	Muxes     []*Mux `yaml:"muxes"`
-
-	// Legacy single-mux shorthand:
-	Front        legacyFront `yaml:"front"`
-	BackendNS    string      `yaml:"backend_ns"`
-	Interconnect string      `yaml:"interconnect"`
-	Attach       string      `yaml:"attach"`
-	PinDir       string      `yaml:"pin_dir"`
-	Identity     Identity    `yaml:"identity"`
-	Peers        []Peer      `yaml:"peers"`
-	Prefixes     []Prefix    `yaml:"prefixes"`
-	Failover     Failover    `yaml:"failover"`
-	Engine       string      `yaml:"engine"`
-	ManageRoutes *bool       `yaml:"manage_routes"`
-	BGP          BGP         `yaml:"bgp"`
-}
-
-type legacyFront struct {
-	Name           string `yaml:"name"`
-	Address        string `yaml:"address"`
-	BackendAddress string `yaml:"backend_address"`
-	MTU            int    `yaml:"mtu"`
-}
-
-func (fc *fileConfig) hasLegacy() bool {
-	return len(fc.Peers) > 0 || fc.Front.Address != "" || fc.Front.BackendAddress != "" ||
-		fc.Identity.PrivateKey != "" || fc.Identity.PrivateKeyFile != "" || len(fc.Prefixes) > 0
-}
-
 // Load reads and validates a YAML config file, filling defaults and
 // resolving all derivations (wg_config peers, front address,
 // effective prefixes).
@@ -404,37 +302,14 @@ func Load(path string) (*Config, error) {
 	if err != nil {
 		return nil, err
 	}
-	var fc fileConfig
+	var cfg Config
 	dec := yaml.NewDecoder(strings.NewReader(string(raw)))
 	dec.KnownFields(true)
-	if err := dec.Decode(&fc); err != nil {
+	if err := dec.Decode(&cfg); err != nil {
 		return nil, fmt.Errorf("parse %s: %w", path, err)
 	}
-	cfg := &Config{APISocket: fc.APISocket}
-	if len(fc.Muxes) > 0 {
-		if fc.hasLegacy() {
-			return nil, fmt.Errorf("%s: muxes: and top-level single-mux fields are mutually exclusive", path)
-		}
-		cfg.Muxes = fc.Muxes
-	} else {
-		cfg.Muxes = []*Mux{{
-			Name:   fc.Front.Name,
-			Engine: fc.Engine,
-			Kernel: KernelOptions{
-				BackendNS:      fc.BackendNS,
-				Interconnect:   fc.Interconnect,
-				Attach:         fc.Attach,
-				PinDir:         fc.PinDir,
-				BackendAddress: fc.Front.BackendAddress,
-			},
-			Front:        Front{Address: fc.Front.Address, MTU: fc.Front.MTU},
-			Identity:     fc.Identity,
-			Peers:        fc.Peers,
-			Prefixes:     fc.Prefixes,
-			Failover:     fc.Failover,
-			BGP:          fc.BGP,
-			ManageRoutes: fc.ManageRoutes,
-		}}
+	if len(cfg.Muxes) == 0 {
+		return nil, fmt.Errorf("%s: no muxes defined (expected a muxes: list)", path)
 	}
 	if cfg.APISocket == "" {
 		cfg.APISocket = "/run/wgmux/wgmuxd.sock"
@@ -442,7 +317,6 @@ func Load(path string) (*Config, error) {
 	dir := filepath.Dir(path)
 	seenNames := map[string]bool{}
 	for _, m := range cfg.Muxes {
-		m.captureSpecified()
 		if err := m.finalize(dir); err != nil {
 			return nil, err
 		}
@@ -454,7 +328,7 @@ func Load(path string) (*Config, error) {
 			fmt.Fprintf(os.Stderr, "wgmux: warning: %s\n", w)
 		}
 	}
-	return cfg, nil
+	return &cfg, nil
 }
 
 // MuxFromWGFiles builds a Mux directly from wg-quick .conf files —
@@ -488,17 +362,6 @@ func (m *Mux) finalize(dir string) error {
 	m.dir = dir
 	if m.Name == "" {
 		m.Name = DefaultMuxName
-	}
-	if m.Kernel.BackendNS != "" {
-		m.Warnings = append(m.Warnings, fmt.Sprintf("mux %s: kernel.backend_ns is derived from the mux name (wgmux-%s); ignoring the configured value", m.Name, m.Name))
-		m.Kernel.BackendNS = ""
-	}
-	if m.Kernel.PinDir != "" {
-		m.Warnings = append(m.Warnings, fmt.Sprintf("mux %s: kernel.pin_dir is derived from the daemon's -pin-root and the mux name; ignoring the configured value", m.Name))
-		m.Kernel.PinDir = ""
-	}
-	if m.Engine == "" {
-		m.Engine = EngineKernel
 	}
 	if m.Failover.HandshakeMaxAge == 0 {
 		m.Failover.HandshakeMaxAge = 150
@@ -633,8 +496,7 @@ func (m *Mux) deriveFront() error {
 
 // resolvePrefixes derives the effective steered prefixes by
 // grouping peers by their declared AllowedIPs, then applies the
-// mux's prefix overrides. When no peer declares AllowedIPs (the
-// legacy inline form), `prefixes:` is the definition instead.
+// mux's prefix overrides.
 func (m *Mux) resolvePrefixes() error {
 	type claim struct {
 		cidr  string
@@ -660,17 +522,7 @@ func (m *Mux) resolvePrefixes() error {
 		}
 	}
 	if !anyDeclared {
-		m.EffectivePrefixes = m.Prefixes
-		for i := range m.EffectivePrefixes {
-			p := &m.EffectivePrefixes[i]
-			if err := p.normalizeModePolicy(); err != nil {
-				return fmt.Errorf("mux %q: prefix %q: %w", m.Name, p.CIDR, err)
-			}
-			if p.Mode == ModeSingle && p.Active == "" && len(p.Candidates) > 0 {
-				p.Active = p.Candidates[0]
-			}
-		}
-		return nil
+		return fmt.Errorf("mux %q: no peer declares AllowedIPs (give wg_config files or allowed_ips)", m.Name)
 	}
 	overrides := map[string]*Prefix{}
 	for i := range m.Prefixes {
@@ -684,9 +536,7 @@ func (m *Mux) resolvePrefixes() error {
 			return fmt.Errorf("duplicate prefix override %q", ov.CIDR)
 		}
 		ov.CIDR = key
-		if err := ov.normalizeModePolicy(); err != nil {
-			return fmt.Errorf("mux %q: prefix override %q: %w", m.Name, ov.CIDR, err)
-		}
+		ov.normalizeModePolicy()
 		overrides[key] = ov
 	}
 	var eff []Prefix
@@ -767,22 +617,12 @@ func (m *Mux) PeerByName(name string) *Peer {
 	return nil
 }
 
-// AllowedIPsFor returns the peer's resolved AllowedIPs: its own
-// declaration when it has one, else every effective prefix listing
-// it as a candidate.
+// AllowedIPsFor returns the peer's resolved AllowedIPs.
 func (m *Mux) AllowedIPsFor(peerName string) []string {
-	if p := m.PeerByName(peerName); p != nil && len(p.allowed) > 0 {
+	if p := m.PeerByName(peerName); p != nil {
 		return p.allowed
 	}
-	var out []string
-	for _, pfx := range m.EffectivePrefixes {
-		for _, cand := range pfx.Candidates {
-			if cand == peerName {
-				out = append(out, pfx.CIDR)
-			}
-		}
-	}
-	return out
+	return nil
 }
 
 func checkKey(field, key string) error {
@@ -799,23 +639,6 @@ func checkKey(field, key string) error {
 func (m *Mux) validate() error {
 	if len(m.Name) > 15 {
 		return fmt.Errorf("mux name %q exceeds 15 characters (it is also the front interface name)", m.Name)
-	}
-	switch m.Engine {
-	case EngineKernel, EngineUserspace:
-	default:
-		return fmt.Errorf("mux %q: engine must be %q or %q, got %q", m.Name, EngineKernel, EngineUserspace, m.Engine)
-	}
-	// interconnect/attach in a config are guards (the real setting
-	// is wgmuxd's startup flags); validate their shape here.
-	switch m.Kernel.Interconnect {
-	case "", InterconnectVeth, InterconnectNetkit:
-	default:
-		return fmt.Errorf("mux %q: kernel.interconnect must be %q or %q, got %q", m.Name, InterconnectVeth, InterconnectNetkit, m.Kernel.Interconnect)
-	}
-	switch m.Kernel.Attach {
-	case "", AttachTCX, AttachTC:
-	default:
-		return fmt.Errorf("mux %q: kernel.attach must be %q or %q, got %q", m.Name, AttachTCX, AttachTC, m.Kernel.Attach)
 	}
 	if err := m.validateBGP(); err != nil {
 		return err
@@ -930,7 +753,7 @@ func (m *Mux) validate() error {
 		switch p.Policy {
 		case PolicyStatic, PolicyFailover, PolicyBGP:
 		default:
-			return fmt.Errorf("mux %q: prefix %q: policy must be static, failover or bgp (legacy: active, hash), got %q", m.Name, p.CIDR, p.Policy)
+			return fmt.Errorf("mux %q: prefix %q: policy must be static, failover or bgp got %q", m.Name, p.CIDR, p.Policy)
 		}
 		switch p.Mode {
 		case ModeSingle:

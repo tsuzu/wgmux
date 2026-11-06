@@ -123,7 +123,7 @@ default to `single` / `static`):
 | Field | Values | Meaning |
 |---|---|---|
 | `mode` | `single` (default), `ecmp` | one selected peer carries all new flows / several, spread by flow hash in proportion to weights |
-| `policy` | `static` (default), `failover`, `bgp` | WHO changes the selection at runtime: nobody but the operator / the handshake-age monitor / BGP paths. Informational for the data plane; the policy runner finds its prefixes by it. Legacy `active` = static+single, `hash` = static+ecmp |
+| `policy` | `static` (default), `failover`, `bgp` | WHO changes the selection at runtime: nobody but the operator / the handshake-age monitor / BGP paths. Informational for the data plane; the policy runner finds its prefixes by it. |
 | `active` | a candidate | initial selection of a `single` prefix (default: first candidate) |
 | `weights` | `{peer: n}` | initial selection of an `ecmp` prefix; keys must be candidates, weights positive; default every candidate at weight 1 |
 

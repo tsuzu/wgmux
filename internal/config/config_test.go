@@ -12,26 +12,30 @@ const (
 	keyB = "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE=" // 32 0x01 bytes, base64
 )
 
-// validYAML is the legacy single-mux shorthand; it must keep working.
+// validYAML is a minimal valid config with inline peers.
 func validYAML() string {
 	return `
-front:
-  address: 10.200.0.2/24
-  backend_address: 10.200.0.1/24
-identity:
-  private_key: "` + keyA + `"
-peers:
-  - name: site-a
-    listen_port: 51820
-    public_key: "` + keyA + `"
-    endpoint: 203.0.113.10:51820
-  - name: site-b
-    listen_port: 51821
-    public_key: "` + keyA + `"
-    endpoint: 203.0.113.11:51820
-prefixes:
-  - cidr: 10.20.0.10/32
-    candidates: [site-a, site-b]
+muxes:
+  - kernel:
+      backend_address: 10.200.0.1/24
+    front:
+      address: 10.200.0.2/24
+    identity:
+      private_key: "` + keyA + `"
+    peers:
+      - name: site-a
+        listen_port: 51820
+        public_key: "` + keyA + `"
+        endpoint: 203.0.113.10:51820
+        allowed_ips: [10.20.0.10/32]
+      - name: site-b
+        listen_port: 51821
+        public_key: "` + keyA + `"
+        endpoint: 203.0.113.11:51820
+        allowed_ips: [10.20.0.10/32]
+    prefixes:
+      - cidr: 10.20.0.10/32
+        candidates: [site-a, site-b]
 `
 }
 
@@ -44,7 +48,7 @@ func load(t *testing.T, body string) (*Config, error) {
 	return Load(path)
 }
 
-func TestLegacyShorthandDefaults(t *testing.T) {
+func TestInlineDefaults(t *testing.T) {
 	cfg, err := load(t, validYAML())
 	if err != nil {
 		t.Fatalf("valid config rejected: %v", err)
@@ -56,7 +60,7 @@ func TestLegacyShorthandDefaults(t *testing.T) {
 	if m.Name != DefaultMuxName {
 		t.Errorf("mux name = %q, want default %q", m.Name, DefaultMuxName)
 	}
-	if m.Engine != EngineKernel || m.Kernel.Interconnect != "" || m.Kernel.BackendAddress != "10.200.0.1/24" {
+	if m.Kernel.BackendAddress != "10.200.0.1/24" {
 		t.Errorf("kernel options not carried: %+v", m.Kernel)
 	}
 	if m.Peers[0].ID != 1 || m.Peers[1].ID != 2 {
@@ -78,15 +82,14 @@ muxes:
     front: {address: 10.200.0.2/24}
     identity: {private_key: "` + keyA + `"}
     peers:
-      - {name: site-a, listen_port: 51820, public_key: "` + keyA + `"}
+      - {name: site-a, listen_port: 51820, public_key: "` + keyA + `", allowed_ips: [10.20.0.10/32]}
     prefixes:
       - {cidr: 10.20.0.10/32, candidates: [site-a]}
   - name: wg-b
-    engine: userspace
     front: {address: 10.201.0.2/24}
     identity: {private_key: "` + keyB + `"}
     peers:
-      - {name: site-a, listen_port: 51830, public_key: "` + keyA + `"}
+      - {name: site-a, listen_port: 51830, public_key: "` + keyA + `", allowed_ips: [10.20.0.10/32]}
     prefixes:
       - {cidr: 10.20.0.10/32, candidates: [site-a]}
 `
@@ -94,7 +97,7 @@ muxes:
 	if err != nil {
 		t.Fatalf("multi-mux config rejected: %v", err)
 	}
-	if len(cfg.Muxes) != 2 || cfg.MuxByName("wg-b").Engine != EngineUserspace {
+	if len(cfg.Muxes) != 2 {
 		t.Fatalf("muxes = %+v", cfg.Muxes)
 	}
 	dup := strings.Replace(body, "name: wg-b", "name: wg-a", 1)
@@ -105,17 +108,18 @@ muxes:
 
 func TestValidationErrors(t *testing.T) {
 	cases := map[string]string{
-		"bad interconnect": strings.Replace(validYAML(), "identity:", "interconnect: gre\nidentity:", 1),
+		"removed engine field": strings.Replace(validYAML(), "  - kernel:", "  - engine: kernel\n    kernel:", 1),
+		"removed interconnect guard": strings.Replace(validYAML(), "backend_address:", "interconnect: veth\n      backend_address:", 1),
 		"unknown candidate": strings.Replace(validYAML(), "candidates: [site-a, site-b]",
 			"candidates: [site-a, nowhere]", 1),
 		"active not candidate": strings.Replace(validYAML(), "candidates: [site-a, site-b]",
-			"candidates: [site-a]\n    active: site-b", 1),
+			"candidates: [site-a]\n        active: site-b", 1),
 		"duplicate listen port": strings.Replace(validYAML(), "listen_port: 51821", "listen_port: 51820", 1),
 		"too many candidates": strings.Replace(validYAML(), "candidates: [site-a, site-b]",
 			"candidates: [site-a, site-b, site-a, site-b, site-a]", 1),
 		"bad policy": strings.Replace(validYAML(), "candidates: [site-a, site-b]",
-			"candidates: [site-a, site-b]\n    policy: random", 1),
-		"ipv6 prefix": strings.Replace(validYAML(), "10.20.0.10/32", "fd00::10/128", 1),
+			"candidates: [site-a, site-b]\n        policy: random", 1),
+		"ipv6 prefix": strings.Replace(validYAML(), "10.20.0.10/32", "fd00::10/128", -1),
 	}
 	for name, body := range cases {
 		t.Run(name, func(t *testing.T) {

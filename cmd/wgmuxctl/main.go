@@ -99,9 +99,6 @@ selection and is not in the new one are moved immediately.
 
 apply flags (direct wg-file mode):
   -name wg-mux        instance name (= front interface name; default wg-mux)
-  -engine kernel      assert the daemon's engine kind (a wgmuxd startup setting)
-  -interconnect veth  assert the daemon's interconnect (kernel, startup setting)
-  -attach tcx         assert the daemon's attach mode (kernel, startup setting)
   -backend-address A  interconnect backend address (creation parameter, kernel only)
   -front-address A    override the front address derived from the conf files
   -manage-routes      install routes to the front interface (default true)
@@ -168,18 +165,16 @@ func selectOneMux(cfg *config.Config, name string) (*config.Mux, error) {
 	return muxes[0], nil
 }
 
-// ensureAndApply checks the apply's daemon-level assumptions
-// (engine kind, kernel shape — startup settings), creates the
+// ensureAndApply checks the daemon's API version, creates the
 // instance if the daemon does not have it yet (verifying
 // creation-parameter immutability if it does), then applies the
-// desired state. It returns the daemon's engine kind (the config's
-// own engine field is only a guard, never the source of truth).
+// desired state. It returns the daemon's engine kind.
 func ensureAndApply(ctx context.Context, client *api.Client, mux *config.Mux, intent config.CreationSpec, resetSelections bool) (string, error) {
 	dinfo, err := client.Info(ctx)
 	if err != nil {
 		return "", err
 	}
-	if err := checkDaemon(dinfo, intent); err != nil {
+	if err := checkDaemon(dinfo); err != nil {
 		return "", err
 	}
 	spec, err := buildSpec(mux)
@@ -215,9 +210,6 @@ func ensureAndApply(ctx context.Context, client *api.Client, mux *config.Mux, in
 func cmdApply(args []string) error {
 	fs := flag.NewFlagSet("apply", flag.ContinueOnError)
 	cf := addCommon(fs)
-	engine := fs.String("engine", "", "assert the daemon's engine kind: kernel | userspace (a wgmuxd startup setting)")
-	interconnect := fs.String("interconnect", "", "assert the daemon's interconnect: veth | netkit (startup setting)")
-	attach := fs.String("attach", "", "assert the daemon's attach mode: tcx | tc (startup setting)")
 	backendAddr := fs.String("backend-address", "", "interconnect backend address (creation parameter, kernel engine)")
 	frontAddr := fs.String("front-address", "", "override the derived front address")
 	frontMTU := fs.Int("front-mtu", 0, "override the front MTU")
@@ -246,18 +238,6 @@ func cmdApply(args []string) error {
 		intent := config.CreationSpec{}
 		visited := map[string]bool{}
 		fs.Visit(func(f *flag.Flag) { visited[f.Name] = true })
-		if visited["engine"] {
-			mux.Engine = *engine
-			intent.Engine, intent.EngineSet = *engine, true
-		}
-		if visited["interconnect"] {
-			mux.Kernel.Interconnect = *interconnect
-			intent.Interconnect, intent.InterconnectSet = *interconnect, true
-		}
-		if visited["attach"] {
-			mux.Kernel.Attach = *attach
-			intent.Attach, intent.AttachSet = *attach, true
-		}
 		if visited["backend-address"] {
 			mux.Kernel.BackendAddress = *backendAddr
 			intent.BackendAddress, intent.BackendAddressSet = *backendAddr, true
@@ -899,8 +879,8 @@ func cmdValidate(args []string) error {
 		if _, err := buildSpec(mux); err != nil {
 			return err
 		}
-		fmt.Printf("wgmuxctl: mux %s OK (%d peers, %d prefixes, engine=%s, bgp=%s)\n",
-			mux.Name, len(mux.Peers), len(mux.EffectivePrefixes), mux.Engine, mux.BGP.Mode)
+		fmt.Printf("wgmuxctl: mux %s OK (%d peers, %d prefixes, bgp=%s)\n",
+			mux.Name, len(mux.Peers), len(mux.EffectivePrefixes), mux.BGP.Mode)
 	}
 	return nil
 }

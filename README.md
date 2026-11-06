@@ -217,10 +217,10 @@ What is configured *when* is part of the design
 | **Derived** | peer names (file base names); steered prefixes + candidates (AllowedIPs grouping); default mode `single`, policy `static`, active (first candidate) |
 
 Creation parameters are immutable for an instance's lifetime:
-`wgmuxctl apply` checks the daemon's startup configuration and the
-existing instance, and rejects an apply that assumes a different
-engine/interconnect/attach or a different backend address (destroy
-+ recreate is the way to change them).
+`wgmuxctl apply` checks an apply against the existing instance and
+rejects a different backend address (destroy + recreate is the way
+to change it). Engine kind, interconnect and attach are wgmuxd
+startup settings and never appear in a config or an apply.
 
 ## Switchable axes
 
@@ -228,9 +228,9 @@ engine/interconnect/attach or a different backend address (destroy
 |---|---|---|
 | engine | `kernel` \| `userspace` | wgmuxd startup (`-engine`) |
 | interconnect | `veth` \| `netkit` | wgmuxd startup, kernel only (netkit needs kernel ≥ 6.7) |
-| attach | `tcx` \| `tc` | wgmuxd startup, kernel only (tcx needs ≥ 6.6; `tc` = legacy clsact) |
+| attach | `tcx` \| `tc` | wgmuxd startup, kernel only (tcx needs ≥ 6.6; `tc` = clsact filters) |
 | per-prefix `mode` | `single` \| `ecmp` | YAML overlay / derived default `single` |
-| per-prefix `policy` | `static` \| `failover` \| `bgp` (legacy: `active` = static+single, `hash` = static+ecmp) | YAML overlay / derived default `static` |
+| per-prefix `policy` | `static` \| `failover` \| `bgp` | YAML overlay / derived default `static` |
 
 Selection changes are map writes: no reload, no device churn.
 
@@ -339,8 +339,8 @@ each one: one daemon → two instances applied **from wg-quick files**
 → traffic lands on the active site on both fronts → an activate on
 one instance leaves the other untouched → a re-apply changes the
 desired state without recreating the instance (creation time
-unchanged) → applies assuming another engine or creation parameter
-are rejected → **the daemon is killed and restarted**: with the
+unchanged) → applying a different creation parameter
+is rejected → **the daemon is killed and restarted**: with the
 kernel engine traffic keeps flowing while no daemon runs, and the
 new daemon reports the instances `adopted` and serves decisions
 with no re-apply (userspace: `restored` from the store) → the

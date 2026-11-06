@@ -76,27 +76,10 @@ func buildSpec(mux *config.Mux) (api.ApplySpec, error) {
 	return spec, nil
 }
 
-// checkDaemon verifies the apply's engine-kind and kernel-shape
-// assumptions (config.CreationSpec tracks which were actually
-// specified) against the daemon's STARTUP configuration. Engine
-// kind, interconnect and attach are chosen when wgmuxd starts; an
-// apply that assumes different ones is rejected here with the
-// reason, instead of silently building something else.
-func checkDaemon(info api.DaemonInfo, intent config.CreationSpec) error {
+// checkDaemon refuses a daemon speaking a different API version.
+func checkDaemon(info api.DaemonInfo) error {
 	if info.APIVersion != api.Version {
 		return fmt.Errorf("wgmuxd speaks API version %d, this wgmuxctl speaks %d: upgrade or downgrade them together", info.APIVersion, api.Version)
-	}
-	if intent.EngineSet && intent.Engine != info.Engine {
-		return fmt.Errorf("this apply assumes engine %q, but the daemon was started with -engine %s (engine kind is a wgmuxd startup setting; use the daemon started for %q, with its own -socket)",
-			intent.Engine, info.Engine, intent.Engine)
-	}
-	if intent.InterconnectSet && info.Interconnect != "" && intent.Interconnect != info.Interconnect {
-		return fmt.Errorf("this apply assumes interconnect %q, but the daemon was started with -interconnect %s (a wgmuxd startup setting)",
-			intent.Interconnect, info.Interconnect)
-	}
-	if intent.AttachSet && info.Attach != "" && intent.Attach != info.Attach {
-		return fmt.Errorf("this apply assumes attach %q, but the daemon was started with -attach %s (a wgmuxd startup setting)",
-			intent.Attach, info.Attach)
 	}
 	return nil
 }

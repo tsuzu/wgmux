@@ -206,23 +206,10 @@ func TestE2E(t *testing.T) {
 	l.waitMarkerDiag("site-a", 120*time.Second)
 	l.waitMarker2("site-a", 60*time.Second)
 
-	// Engine kind is a DAEMON-startup choice: an apply that assumes
-	// the other engine is rejected against this daemon.
-	otherEngine := "userspace"
-	if l.daemonEngine == "userspace" {
-		otherEngine = "kernel"
-	}
-	l.t.Logf("$ wgmuxctl apply --name wg-mux --engine %s /etc/wgmux/mux1/site-a.conf /etc/wgmux/mux1/site-b.conf  (must fail)", otherEngine)
-	out, err := l.execOK(muxNode, "wgmuxctl apply --name wg-mux --engine "+otherEngine+
-		" /etc/wgmux/mux1/site-a.conf /etc/wgmux/mux1/site-b.conf")
-	if err == nil || !strings.Contains(out, "startup") {
-		l.t.Fatalf("apply with wrong engine assumption not rejected: err=%v out=%s", err, out)
-	}
-	l.t.Logf("  -> rejected as expected: %s", strings.TrimSpace(out))
-	// And the one per-instance creation parameter (backend-address
+	// The one per-instance creation parameter (backend-address
 	// override) is immutable for an existing instance.
 	l.t.Logf("$ wgmuxctl apply --name wg-mux --backend-address 10.200.0.99/24 /etc/wgmux/mux1/site-a.conf /etc/wgmux/mux1/site-b.conf  (must fail)")
-	out, err = l.execOK(muxNode, "wgmuxctl apply --name wg-mux --backend-address 10.200.0.99/24"+
+	out, err := l.execOK(muxNode, "wgmuxctl apply --name wg-mux --backend-address 10.200.0.99/24"+
 		" /etc/wgmux/mux1/site-a.conf /etc/wgmux/mux1/site-b.conf")
 	if err == nil || !strings.Contains(out, "immutable") {
 		l.t.Fatalf("backend-address change on existing instance not rejected: err=%v out=%s", err, out)

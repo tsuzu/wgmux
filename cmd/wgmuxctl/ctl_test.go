@@ -103,10 +103,10 @@ func TestBuildSpecCarriesModeAndSelection(t *testing.T) {
 }
 
 func TestCheckDaemonAPIVersion(t *testing.T) {
-	if err := checkDaemon(api.DaemonInfo{APIVersion: api.Version + 1, Engine: "kernel"}, config.CreationSpec{}); err == nil {
+	if err := checkDaemon(api.DaemonInfo{APIVersion: api.Version + 1}); err == nil {
 		t.Error("mismatched api version accepted")
 	}
-	if err := checkDaemon(api.DaemonInfo{APIVersion: api.Version, Engine: "kernel"}, config.CreationSpec{}); err != nil {
+	if err := checkDaemon(api.DaemonInfo{APIVersion: api.Version}); err != nil {
 		t.Error(err)
 	}
 }

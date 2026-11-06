@@ -23,7 +23,6 @@
 #   mode:    single | ecmp     one selected peer / flows spread over several
 #   policy:  static | failover | bgp
 #                              who changes the selection at runtime
-#                              (legacy: active = static+single, hash = static+ecmp)
 #   active:  <peer>            initial peer (mode single; default: first candidate)
 #   weights: {peer: n}         initial ECMP selection (mode ecmp; default all, 1 each)
 #
@@ -38,11 +37,8 @@ muxes:
   # --- Mux 1: two sites, both claiming the same inner IP, fed by
   # --- the wg-quick files the operator already has.
   - name: wg-mux # instance name == the front interface's name
-    # engine: kernel  # guard only: must match wgmuxd's -engine
     # kernel:
-    #   interconnect: veth  # guard only: must match wgmuxd's -interconnect
-    #   attach: tcx         # guard only: must match wgmuxd's -attach
-    #   backend_address: 10.200.0.1/24  # the one creation parameter
+    #   backend_address: 10.200.0.1/24  # the one creation parameter (kernel engine)
     peers:
       - {name: site-a, wg_config: site-a.conf} # paths are relative to this file
       - {name: site-b, wg_config: site-b.conf}

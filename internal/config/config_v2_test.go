@@ -10,31 +10,18 @@ import (
 
 const cand2 = "candidates: [site-a, site-b]"
 
-func TestLegacyPolicyMapping(t *testing.T) {
-	for policy, want := range map[string][2]string{
-		"active": {ModeSingle, PolicyStatic},
-		"hash":   {ModeECMP, PolicyStatic},
-	} {
-		body := strings.Replace(validYAML(), cand2, cand2+"\n    policy: "+policy, 1)
-		cfg, err := load(t, body)
-		if err != nil {
-			t.Fatalf("%s: %v", policy, err)
+func TestRejectsRemovedPolicySpellings(t *testing.T) {
+	for _, policy := range []string{"active", "hash"} {
+		body := strings.Replace(validYAML(), cand2, cand2+"\n            policy: "+policy, 1)
+		if _, err := load(t, body); err == nil {
+			t.Errorf("policy %q accepted", policy)
 		}
-		p := cfg.Muxes[0].EffectivePrefixes[0]
-		if p.Mode != want[0] || p.Policy != want[1] {
-			t.Errorf("legacy %s -> mode %s policy %s, want %v", policy, p.Mode, p.Policy, want)
-		}
-	}
-	// A legacy spelling contradicting an explicit mode is an error.
-	body := strings.Replace(validYAML(), cand2, cand2+"\n    policy: hash\n    mode: single", 1)
-	if _, err := load(t, body); err == nil {
-		t.Error("policy hash + mode single accepted")
 	}
 }
 
 func TestECMPWeightsAndSelection(t *testing.T) {
 	body := strings.Replace(validYAML(), cand2,
-		cand2+"\n    mode: ecmp\n    policy: failover\n    weights: {site-b: 3, site-a: 1}", 1)
+		cand2+"\n        mode: ecmp\n        policy: failover\n        weights: {site-b: 3, site-a: 1}", 1)
 	cfg, err := load(t, body)
 	if err != nil {
 		t.Fatal(err)
@@ -49,7 +36,7 @@ func TestECMPWeightsAndSelection(t *testing.T) {
 		t.Errorf("selection = %+v", sel)
 	}
 	// ecmp without weights: every candidate, weight 1.
-	cfg, err = load(t, strings.Replace(validYAML(), cand2, cand2+"\n    mode: ecmp", 1))
+	cfg, err = load(t, strings.Replace(validYAML(), cand2, cand2+"\n        mode: ecmp", 1))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -57,7 +44,7 @@ func TestECMPWeightsAndSelection(t *testing.T) {
 		t.Errorf("default ecmp selection = %+v", sel)
 	}
 	// weights on a subset: only those peers are initially selected.
-	cfg, err = load(t, strings.Replace(validYAML(), cand2, cand2+"\n    mode: ecmp\n    weights: {site-b: 2}", 1))
+	cfg, err = load(t, strings.Replace(validYAML(), cand2, cand2+"\n        mode: ecmp\n        weights: {site-b: 2}", 1))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -67,7 +54,7 @@ func TestECMPWeightsAndSelection(t *testing.T) {
 }
 
 func TestSingleSelection(t *testing.T) {
-	cfg, err := load(t, strings.Replace(validYAML(), cand2, cand2+"\n    active: site-b", 1))
+	cfg, err := load(t, strings.Replace(validYAML(), cand2, cand2+"\n        active: site-b", 1))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -82,15 +69,15 @@ func TestSingleSelection(t *testing.T) {
 
 func TestV2ValidationErrors(t *testing.T) {
 	cases := map[string]string{
-		"weights in single":      strings.Replace(validYAML(), cand2, cand2+"\n    weights: {site-a: 1}", 1),
-		"weight non-candidate":   strings.Replace(validYAML(), cand2, cand2+"\n    mode: ecmp\n    weights: {ghost: 1}", 1),
-		"weight zero":            strings.Replace(validYAML(), cand2, cand2+"\n    mode: ecmp\n    weights: {site-a: 0}", 1),
-		"weight negative":        strings.Replace(validYAML(), cand2, cand2+"\n    mode: ecmp\n    weights: {site-a: -2}", 1),
-		"active in ecmp":         strings.Replace(validYAML(), cand2, cand2+"\n    mode: ecmp\n    active: site-a", 1),
-		"bad mode":               strings.Replace(validYAML(), cand2, cand2+"\n    mode: anycast", 1),
+		"weights in single":      strings.Replace(validYAML(), cand2, cand2+"\n        weights: {site-a: 1}", 1),
+		"weight non-candidate":   strings.Replace(validYAML(), cand2, cand2+"\n        mode: ecmp\n        weights: {ghost: 1}", 1),
+		"weight zero":            strings.Replace(validYAML(), cand2, cand2+"\n        mode: ecmp\n        weights: {site-a: 0}", 1),
+		"weight negative":        strings.Replace(validYAML(), cand2, cand2+"\n        mode: ecmp\n        weights: {site-a: -2}", 1),
+		"active in ecmp":         strings.Replace(validYAML(), cand2, cand2+"\n        mode: ecmp\n        active: site-a", 1),
+		"bad mode":               strings.Replace(validYAML(), cand2, cand2+"\n        mode: anycast", 1),
 		"duplicate candidate":    strings.Replace(validYAML(), cand2, "candidates: [site-a, site-a]", 1),
-		"peer id too large":      strings.Replace(validYAML(), "- name: site-a", "- name: site-a\n    id: 256", 1),
-		"bgp policy without bgp": strings.Replace(validYAML(), cand2, cand2+"\n    policy: bgp", 1),
+		"peer id too large":      strings.Replace(validYAML(), "- name: site-a", "- name: site-a\n        id: 256", 1),
+		"bgp policy without bgp": strings.Replace(validYAML(), cand2, cand2+"\n        policy: bgp", 1),
 	}
 	for name, body := range cases {
 		t.Run(name, func(t *testing.T) {
@@ -106,12 +93,12 @@ func TestCandidateLimit(t *testing.T) {
 		var peers, names []string
 		for i := 0; i < n; i++ {
 			nm := fmt.Sprintf("p%02d", i)
-			peers = append(peers, fmt.Sprintf("  - {name: %s, listen_port: %d, public_key: \"%s\"}", nm, 40000+i, keyA))
+			peers = append(peers, fmt.Sprintf("      - {name: %s, listen_port: %d, public_key: \"%s\", allowed_ips: [10.20.0.10/32]}", nm, 40000+i, keyA))
 			names = append(names, nm)
 		}
-		return "front: {address: 10.200.0.2/24}\nidentity: {private_key: \"" + keyA + "\"}\npeers:\n" +
+		return "muxes:\n  - front: {address: 10.200.0.2/24}\n    identity: {private_key: \"" + keyA + "\"}\n    peers:\n" +
 			strings.Join(peers, "\n") +
-			"\nprefixes:\n  - {cidr: 10.20.0.10/32, mode: ecmp, candidates: [" + strings.Join(names, ", ") + "]}\n"
+			"\n    prefixes:\n      - {cidr: 10.20.0.10/32, mode: ecmp, candidates: [" + strings.Join(names, ", ") + "]}\n"
 	}
 	if _, err := load(t, mk(64)); err != nil {
 		t.Errorf("64 candidates rejected: %v", err)
