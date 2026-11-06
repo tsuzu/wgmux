@@ -275,11 +275,11 @@ func populate(info Info, entries []steer.Entry, maps map[string]*ebpf.Map) error
 		}
 	}
 	for peerID, ifindex := range info.PeerIfindex {
-		if err := maps[MapPeerDev].Put(peerID, uint32(ifindex)); err != nil {
+		if err := maps[MapPeerDev].Put(peerID, steer.PeerVal{Ifindex: uint32(ifindex)}); err != nil {
 			return fmt.Errorf("put peer_dev %d: %w", peerID, err)
 		}
 	}
-	rc := steer.RuntimeCfg{BackIfindex: uint32(info.BackIfindex)}
+	rc := steer.RuntimeCfg{BackIfindex: uint32(info.BackIfindex), SpecHash: 0}
 	rc.FrontMAC = info.FrontMAC
 	rc.BackMAC = info.BackMAC
 	if err := maps[MapRuntimeCfg].Put(uint32(0), rc); err != nil {
@@ -298,13 +298,10 @@ func OpenPinnedSteering(pinDir string) (*ebpf.Map, error) {
 }
 
 // DebugCounterNames names the debug map slots, in index order
-// (indices are defined in bpf/mux.c). The first three from_wg slots
-// after wg_entries are legacy diagnostics of the datapath's
-// development; they stay because the counters cost nothing.
+// (indices are defined in bpf/mux.c).
 var DebugCounterNames = []string{
-	"front_entries", "front_framed", "front_strips", "front_last_len",
-	"front_last_word0", "front_after_len", "front_after_word0", "front_redirects",
-	"wg_entries", "wg_cfg_fail", "wg_grow_fail", "wg_store_fail", "wg_redirects",
+	"front_entries", "front_redirects", "front_unsteered", "front_no_peer",
+	"front_pin_hits", "front_pin_stale", "wg_entries", "wg_redirects", "wg_cfg_fail",
 }
 
 // Counters reads the pinned debug map and returns the counters by
@@ -340,36 +337,6 @@ func DebugSnapshot(pinDir string) ([]uint64, error) {
 	return out, nil
 }
 
-// ---- v2 runtime API (implemented by the datapath workstream) ----
-
-var errTODO = errors.New("datapath v2: implemented by the datapath workstream")
-
-// ReplaceSteering makes the pinned steering map hold exactly
-// entries: puts every entry, then deletes keys not in entries. Used
-// by the kernel engine's in-place re-apply (no program reload).
-func ReplaceSteering(pinDir string, entries []steer.Entry) error { return errTODO }
-
-// SetSlots overwrites one existing prefix's slot table; error if the
-// key is not in the map.
-func SetSlots(pinDir string, key steer.SteeringKey, slots steer.SlotTable) error {
-	return errTODO
-}
-
-// BumpPeerGen increments peer_dev[peerID].Gen, invalidating every
-// flow pin to that peer (FlushPeer).
-func BumpPeerGen(pinDir string, peerID uint32) error { return errTODO }
-
-// SteeringSnapshot reads all steering entries.
-func SteeringSnapshot(pinDir string) (map[steer.SteeringKey]steer.SlotTable, error) {
-	return nil, errTODO
-}
-
-// SetSpecHash writes runtime_cfg[0].SpecHash (0 = apply in progress).
-func SetSpecHash(pinDir string, h uint64) error { return errTODO }
-
-// SpecHash reads runtime_cfg[0].SpecHash.
-func SpecHash(pinDir string) (uint64, error) { return 0, errTODO }
-
 // Unpin removes pinned maps and links created by Apply.
 func Unpin(pinDir string) error {
 	var errs []error
@@ -386,7 +353,7 @@ func Unpin(pinDir string) error {
 		}
 		os.Remove(linksDir)
 	}
-	for _, name := range []string{MapSteering, MapFlowPeer, MapPeerDev, MapRuntimeCfg} {
+	for _, name := range []string{MapSteering, MapFlowPeer, MapPeerDev, MapRuntimeCfg, MapDebug} {
 		if err := os.Remove(filepath.Join(pinDir, name)); err != nil && !os.IsNotExist(err) {
 			errs = append(errs, err)
 		}
