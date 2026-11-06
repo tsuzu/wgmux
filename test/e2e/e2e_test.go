@@ -321,7 +321,7 @@ func TestE2E(t *testing.T) {
 	l.mustStatus("wg-mux", "selection site-b:1")
 	l.waitUDPTail("site-b", 60*time.Second)
 	l.t.Logf("established UDP flow moved to site-b after site-a died")
-	l.exec(muxNode, "pkill -f udpprobe.py || true")
+	l.exec(muxNode, "pkill -f '[u]dpprobe.py' || true")
 
 	// Destroying wg-mux leaves wg-mux2 passing traffic.
 	l.ctl("destroy --name wg-mux")
