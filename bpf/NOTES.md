@@ -24,33 +24,46 @@ per-instance constant (see below).
   Key `struct steering_key { __u32 prefixlen; __u32 addr; }`
   (addr in network byte order; the program always looks up with
   `prefixlen = 32`, LPM finds the longest matching entry).
-  Value `struct steering_val { __u32 peer_id[4]; __u8 count;
-  __u8 active; __u8 policy; __u8 pad; }`.
-  `peer_id[0..count)` are the candidate peers for the prefix.
-  - `policy == 0`: use `peer_id[active]` (bounds-checked,
-    `active < count`, otherwise the packet passes unsteered).
-  - `policy == 1`: use `peer_id[flow_hash(flow_key) % count]` —
-    deterministic per flow, so a given flow stays on one peer as long
-    as the candidate set does not change.
+  Value `struct steering_val { __u32 slot[64]; }` — the prefix's ECMP
+  slot table. A new flow takes `slot[flow_hash(flow_key) & 63]`
+  (single-peer prefix: all 64 slots the same peer id; weighted ECMP:
+  slots apportioned by weight). Slot value `0` (`steer.NoPeer`) means
+  drop. There is no policy field: policy is control-plane
+  information only.
 - `flow_peer` — `BPF_MAP_TYPE_LRU_HASH`, `max_entries` 65536.
   Key `struct flow_key { __u32 saddr; __u32 daddr; __u16 sport;
   __u16 dport; __u8 proto; __u8 pad[3]; }`, all fields as they appear
   in the packet (addresses and ports in network byte order).
-  Value `__u32` peer_id. Keys are always stored in the
-  local→remote direction: `mux_from_wg` inserts the *reversed* key so
-  the reply of a remote-initiated flow, and later packets of a flow
-  whichever side started it, hit the same entry. Consulted before
-  `steering` in `mux_from_front`, so an established flow is pinned
-  even if `steering.active` / the candidate set changes afterwards.
+  Value `struct flow_pin { __u32 peer_id; __u32 gen; }`. Keys are
+  always stored in the local→remote direction: `mux_from_wg` inserts
+  the *reversed* key with `{own_peer_id, peer_dev[own].gen}` (gen 0 if
+  the peer_dev entry is missing) so the reply of a remote-initiated
+  flow, and later packets of a flow whichever side started it, hit
+  the same entry. Consulted before `steering` in `mux_from_front`.
+  **A pin is honored only if** `peer_dev[pin.peer_id]` exists, its
+  ifindex is non-zero and its `gen` equals `pin.gen`; otherwise
+  (counted as `front_pin_stale`) the flow re-selects through the slot
+  table and is re-pinned with the peer's current gen.
 - `peer_dev` — `BPF_MAP_TYPE_ARRAY`, `max_entries` 256.
-  Key `__u32` peer_id, value `__u32` ifindex of that Peer's wg device
-  *in the backend netns*. A steered packet whose peer has no entry (or
-  ifindex 0) is dropped with `TC_ACT_SHOT`, not passed.
+  Key `__u32` peer_id, value `struct peer_info { __u32 ifindex;
+  __u32 gen; }`: ifindex of that Peer's wg device *in the backend
+  netns* and the peer's pin generation. A steered packet whose slot
+  is `0`, or whose peer has no entry / ifindex 0, is dropped with
+  `TC_ACT_SHOT` (`front_no_peer`), not passed. Bumping `gen`
+  (`datapath.BumpPeerGen`, i.e. FlushPeer) invalidates every pin to
+  that peer in O(1).
 - `runtime_cfg` — `BPF_MAP_TYPE_ARRAY`, `max_entries` 1, only key 0.
   Value `struct runtime_cfg { __u32 back_ifindex; __u8 front_mac[6];
-  __u8 back_mac[6]; }`: ifindex of the interconnect backend end, and
-  the fixed MAC addresses of the two interconnect ends (used only in
-  veth / `l2_mode`; the link is point-to-point, no ARP is involved).
+  __u8 back_mac[6]; __u64 spec_hash; }` (24 bytes): ifindex of the
+  interconnect backend end, the fixed MAC addresses of the two
+  interconnect ends (used only in veth / `l2_mode`), and the kernel
+  engine's completed-apply marker (`spec_hash`, 0 while an apply is in
+  progress; never read by the programs).
+- `debug` — `BPF_MAP_TYPE_ARRAY`, 16 `__u64` counters, indices:
+  0 front_entries, 1 front_redirects, 2 front_unsteered (no LPM match
+  or unparseable: `TC_ACT_OK`), 3 front_no_peer (`TC_ACT_SHOT`),
+  4 front_pin_hits, 5 front_pin_stale, 6 wg_entries, 7 wg_redirects,
+  8 wg_cfg_fail (`datapath.DebugCounterNames`).
 
 ## Per-instance constants (`const volatile`, rewritten by the loader)
 
@@ -95,10 +108,10 @@ per-instance constant (see below).
   header first, then 4 bytes of L4 ports at `hdr_off + IHL*4`), so no
   direct-access pointer arithmetic has to be tracked across the
   variable IHL. IHL is validated (`5 <= ihl <= 15`).
-- `peer_id[]` indexing is verifier-friendly by construction: after the
-  policy branch, `idx` satisfies `idx < count <= 4`, and is then
-  additionally masked with `& (4 - 1)` before the array access so the
-  verifier can prove the access is in bounds.
+- `slot[]` indexing is verifier-friendly by construction: the index is
+  `flow_hash(fk) & 63`, with `barrier_var` between the hash and the
+  mask so clang cannot delete the mask as redundant (the verifier
+  could not re-derive the bound without it).
 - No loops at all; hashing is a fixed Jenkins-style mix over the
   flow-key fields.
 - Non-IPv4, truncated or otherwise unparseable packets return
@@ -118,9 +131,22 @@ per-instance constant (see below).
   pressure (more than 65536 flows) old entries can be evicted, after
   which a mid-flight flow may be re-steered by `steering` and break if
   the new peer is a different host.
-- **Policy 1 rehashing.** Changing `count` or the candidate order for
-  a prefix changes `hash % count` for existing flows that are not (or
-  no longer) pinned in `flow_peer`, with the same caveat.
+- **Slot-table changes and established flows.** Replacing a slot
+  table (`SetSlots`) does not move established flows: they keep their
+  pin (graceful). New flows use the new table. To move existing flows
+  off a peer, flush it: `BumpPeerGen` increments `peer_dev[id].gen`,
+  every pin to that peer becomes stale and re-selects through the
+  slot table on its next packet. Flush is per peer, O(1), and also
+  invalidates the reverse pins `mux_from_wg` recorded for that peer.
+- **ECMP granularity.** 64 slots per prefix: weights are quantized to
+  1/64 and every selected peer gets at least one slot. Unpinned flows
+  of a prefix whose table changed re-hash to whatever the new table
+  says (resilient `BuildSlots` keeps most slots stable).
+- **Spec hash / in-place re-apply.** `ReplaceSteering` updates the
+  LPM trie key by key (put new, then delete stale) without reloading
+  programs, so lookups during the update see either the old or new
+  table of a prefix, never an empty trie. `runtime_cfg.spec_hash` is
+  set to 0 before such an update and to the new hash afterwards.
 - **GSO/GRO.** The programs never segment or coalesce packets; they
   only adjust the L2 room and redirect the `skb`. Oversized (GSO)
   `skb`s coming from the front are handed to the wg device as-is and
@@ -131,22 +157,19 @@ per-instance constant (see below).
   drops for non-GSO traffic. The Ethernet header grow/shrink via
   `bpf_skb_adjust_room` may, on packets with little headroom, expand
   the `skb` head — cheaper than a routing pass, but not zero-cost.
-- **Compile check passed (2026-10-26)**, once clang 18 + libbpf
-  headers were installed; the committed object is
-  `internal/datapath/mux.o`:
+- **Build and verification.** The committed object is
+  `internal/datapath/mux.o`, built in the `wgmux-dev` image:
 
   ```sh
   clang -O2 -g -Wall -target bpf -D__TARGET_ARCH_x86 \
-    -I/usr/include -I/usr/include/x86_64-linux-gnu \
-    -c bpf/mux.c -o internal/datapath/mux.o
+    -I/usr/include -c bpf/mux.c -o internal/datapath/mux.o
   ```
 
-  (The multiarch include dir is needed for `asm/types.h` on
-  Debian/Ubuntu.) **Verifier check is still outstanding**: the
-  authoring environment is a restricted container where BPF program
-  loads are not permitted, so run
-  `WGMUX_TEST_LOAD=1 go test ./internal/datapath/` on a normal host
-  to have the kernel verifier check both programs and all maps.
+  The kernel verifier accepts both programs (verified with
+  `WGMUX_TEST_LOAD=1 go test ./internal/datapath/` in a privileged
+  container with bpffs mounted; the same test also exercises the
+  runtime map API and, through `BPF_PROG_TEST_RUN`, slot selection,
+  pin-generation invalidation, NoPeer drops and unsteered pass).
 
 ## Place in the engine model
 
@@ -164,7 +187,7 @@ The pins are also the persistence mechanism: because the steering
 state lives in pinned maps (not in the daemon), the kernel
 datapath keeps forwarding while wgmuxd is stopped, and a restarted
 daemon *adopts* the instance — it probes the namespace, the pin
-dir and the pinned steering map, and resumes `State`/`SetActive`
+dir and the pinned steering map, and resumes `State`/`SetSelection`
 against them without reprogramming anything. The userspace
 (wireguard-go) engine implements the same selection semantics in a
 Go pump (`internal/steer`); it uses none of this file's machinery.

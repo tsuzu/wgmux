@@ -57,7 +57,7 @@
 /* Shared types (must match the Go loader exactly)                     */
 /* ------------------------------------------------------------------ */
 
-#define MAX_CANDIDATE_PEERS 4
+#define STEER_SLOTS 64
 #define STEERING_MAX_ENTRIES 1024
 #define FLOW_PEER_MAX_ENTRIES 65536
 #define PEER_DEV_MAX_ENTRIES 256
@@ -67,12 +67,21 @@ struct steering_key {
 	__u32 addr; /* network byte order */
 };
 
+/* ECMP slot table of one steered prefix: a new flow takes
+ * slot[flow_hash & (STEER_SLOTS-1)]; 0 (NoPeer) = drop.
+ */
 struct steering_val {
-	__u32 peer_id[MAX_CANDIDATE_PEERS];
-	__u8 count;
-	__u8 active;
-	__u8 policy; /* 0 = peer_id[active], 1 = per-flow hash over peer_id[0..count) */
-	__u8 pad;
+	__u32 slot[STEER_SLOTS];
+};
+
+struct flow_pin {
+	__u32 peer_id;
+	__u32 gen; /* peer_dev[peer_id].gen at pin time */
+};
+
+struct peer_info {
+	__u32 ifindex;
+	__u32 gen; /* bumped to invalidate every pin to this peer */
 };
 
 struct flow_key {
@@ -88,6 +97,7 @@ struct runtime_cfg {
 	__u32 back_ifindex;
 	__u8 front_mac[6];
 	__u8 back_mac[6];
+	__u64 spec_hash; /* userspace-only apply marker; unused here */
 };
 
 /* ------------------------------------------------------------------ */
@@ -138,7 +148,7 @@ struct {
 	__uint(max_entries, FLOW_PEER_MAX_ENTRIES);
 	__uint(pinning, LIBBPF_PIN_BY_NAME);
 	__type(key, struct flow_key);
-	__type(value, __u32);
+	__type(value, struct flow_pin);
 } flow_peer SEC(".maps");
 
 struct {
@@ -146,7 +156,7 @@ struct {
 	__uint(max_entries, PEER_DEV_MAX_ENTRIES);
 	__uint(pinning, LIBBPF_PIN_BY_NAME);
 	__type(key, __u32);
-	__type(value, __u32);
+	__type(value, struct peer_info);
 } peer_dev SEC(".maps");
 
 struct {
@@ -169,27 +179,15 @@ struct {
 	__type(value, __u64);
 } debug SEC(".maps");
 
-#define DBG_FRONT_ENTRIES 0  /* mux_from_front invocations */
-#define DBG_FRAMED 1	     /* of those, on an L2 (veth) interconnect */
-#define DBG_STRIP_CALLS 2    /* unused (kept for index stability) */
-#define DBG_LAST_LEN 3	     /* skb->len at entry */
-#define DBG_LAST_WORD0 4     /* first 4 bytes at entry */
-#define DBG_AFTER_LEN 5	     /* unused (kept for index stability) */
-#define DBG_AFTER_WORD0 6    /* unused (kept for index stability) */
-#define DBG_REDIRECTS 7	     /* bpf_redirect calls from mux_from_front */
-#define DBG_WG_ENTRIES 8     /* mux_from_wg invocations */
-#define DBG_WG_CFG_FAIL 9    /* runtime_cfg missing/back_ifindex 0 */
-#define DBG_WG_GROW_FAIL 10  /* bpf_skb_adjust_room grow failed */
-#define DBG_WG_STORE_FAIL 11 /* bpf_skb_store_bytes of the eth header failed */
-#define DBG_WG_REDIRECTS 12  /* bpf_redirect calls from mux_from_wg */
-
-static __always_inline void dbg_set(__u32 idx, __u64 val)
-{
-	__u64 *slot = bpf_map_lookup_elem(&debug, &idx);
-
-	if (slot)
-		*slot = val;
-}
+#define DBG_FRONT_ENTRIES 0   /* mux_from_front invocations */
+#define DBG_FRONT_REDIRECTS 1 /* bpf_redirect calls from mux_from_front */
+#define DBG_FRONT_UNSTEERED 2 /* no LPM match / unparseable: TC_ACT_OK */
+#define DBG_FRONT_NO_PEER 3   /* NoPeer slot or no peer_dev: TC_ACT_SHOT */
+#define DBG_FRONT_PIN_HITS 4  /* valid flow pin used */
+#define DBG_FRONT_PIN_STALE 5 /* pin found but peer/gen invalid */
+#define DBG_WG_ENTRIES 6      /* mux_from_wg invocations */
+#define DBG_WG_REDIRECTS 7    /* bpf_redirect calls from mux_from_wg */
+#define DBG_WG_CFG_FAIL 8     /* runtime_cfg missing/back_ifindex 0 */
 
 static __always_inline void dbg_inc(__u32 idx)
 {
@@ -254,19 +252,16 @@ static __always_inline int parse_flow_key(struct __sk_buff *skb,
 /*
  * Note on barrier_var (from bpf_helpers.h): it hides a value's
  * provenance from clang. It is needed before masking an index into a
- * map value array (see mux_from_front): clang can prove from the
- * source-level range checks that the mask is redundant and delete
- * it, but the kernel verifier cannot reproduce that proof (it does
- * not narrow a map-loaded u8 through the wrapped subtract-and-
- * compare sequence clang emits for the checks), so the unmasked
- * index looks unbounded to the verifier and the load fails.
+ * map value array (see select_peer): clang may prove the mask
+ * redundant and delete it, but the kernel verifier cannot
+ * reproduce that proof, so the unmasked index looks unbounded to
+ * the verifier and the load fails.
  */
 
 /*
- * Simple Jenkins-style mix over the flow key fields.  Used for
- * steering policy 1 to spread flows deterministically over the
- * candidate peers for a prefix (same flow -> same hash -> same peer,
- * at least until the candidate set changes).
+ * Simple Jenkins-style mix over the flow key fields.  Picks the
+ * slot of a prefix's slot table for a new flow (steer.Hash in Go is
+ * an exact transcription).
  */
 static __always_inline __u32 flow_hash(const struct flow_key *fk)
 {
@@ -288,19 +283,35 @@ static __always_inline __u32 flow_hash(const struct flow_key *fk)
 }
 
 /*
- * Shared peer selection: an established flow (flow_peer) wins;
- * otherwise the steering LPM decides by destination and the choice
- * is recorded so the flow sticks to its peer.  Returns 0 and sets
- * *peer_id_out, or -1 when the destination is not steered.
+ * Shared peer selection.  A flow pin wins only while it is valid:
+ * peer_dev[pin.peer_id] exists, has an ifindex and its gen equals
+ * the pin's gen (a gen bump invalidates all pins to a peer in O(1)).
+ * Otherwise the steering LPM decides by destination: the flow takes
+ * slot[hash & 63] and is re-pinned with the peer's current gen.
+ *
+ * Returns 0 and sets *peer_id_out / *ifindex_out; -1 when the
+ * destination is not steered; -2 when it is steered but has no usable
+ * peer (NoPeer slot or peer without a device).
  */
 static __always_inline int select_peer(const struct flow_key *fk,
-				       __u32 *peer_id_out)
+				       __u32 *peer_id_out, __u32 *ifindex_out)
 {
-	__u32 *pinned = bpf_map_lookup_elem(&flow_peer, fk);
+	struct flow_pin *pin = bpf_map_lookup_elem(&flow_peer, fk);
+	struct peer_info *pd;
+	struct flow_pin np;
+	__u32 peer_id;
+	__u32 idx;
 
-	if (pinned) {
-		*peer_id_out = *pinned;
-		return 0;
+	if (pin) {
+		peer_id = pin->peer_id;
+		pd = bpf_map_lookup_elem(&peer_dev, &peer_id);
+		if (pd && pd->ifindex != 0 && pd->gen == pin->gen) {
+			*peer_id_out = peer_id;
+			*ifindex_out = pd->ifindex;
+			dbg_inc(DBG_FRONT_PIN_HITS);
+			return 0;
+		}
+		dbg_inc(DBG_FRONT_PIN_STALE);
 	}
 
 	struct steering_key skey = {
@@ -308,37 +319,32 @@ static __always_inline int select_peer(const struct flow_key *fk,
 		.addr = fk->daddr,
 	};
 	struct steering_val *val = bpf_map_lookup_elem(&steering, &skey);
-	__u32 idx;
 
 	if (!val)
 		return -1;
 
-	if (val->count == 0 || val->count > MAX_CANDIDATE_PEERS)
-		return -1;
-
-	if (val->policy == 0) {
-		if (val->active >= val->count)
-			return -1;
-		idx = val->active;
-	} else if (val->policy == 1) {
-		idx = flow_hash(fk) % val->count;
-	} else {
-		return -1; /* unknown policy */
-	}
-
 	/*
 	 * Mask the index to the array bounds so the verifier can
-	 * prove the peer_id[] access is in range.  The mask is a
-	 * no-op semantically (idx < count <= 4 in both policies
-	 * above), but it must survive compilation: barrier_var hides
-	 * idx's provenance so clang cannot delete the mask as
-	 * redundant (see barrier_var).
+	 * prove the slot[] access is in range.  barrier_var hides
+	 * idx's provenance so clang cannot delete the mask (see
+	 * barrier_var).
 	 */
+	idx = flow_hash(fk);
 	barrier_var(idx);
-	idx &= MAX_CANDIDATE_PEERS - 1;
-	*peer_id_out = val->peer_id[idx];
+	idx &= STEER_SLOTS - 1;
+	peer_id = val->slot[idx];
+	if (peer_id == 0)
+		return -2;
 
-	bpf_map_update_elem(&flow_peer, fk, peer_id_out, BPF_ANY);
+	pd = bpf_map_lookup_elem(&peer_dev, &peer_id);
+	if (!pd || pd->ifindex == 0)
+		return -2;
+
+	np.peer_id = peer_id;
+	np.gen = pd->gen;
+	bpf_map_update_elem(&flow_peer, fk, &np, BPF_ANY);
+	*peer_id_out = peer_id;
+	*ifindex_out = pd->ifindex;
 	return 0;
 }
 
@@ -352,26 +358,25 @@ int mux_from_front(struct __sk_buff *skb)
 	const __u32 hdr_off = l2_mode ? ETH_HLEN : 0;
 	struct flow_key fk;
 	__u32 peer_id;
-	__u32 *ifindex;
-	__u32 word0 = 0;
+	__u32 ifindex;
+	int rc;
 
 	dbg_inc(DBG_FRONT_ENTRIES);
-	dbg_set(DBG_LAST_LEN, skb->len);
-	if (bpf_skb_load_bytes(skb, 0, &word0, sizeof(word0)) == 0)
-		dbg_set(DBG_LAST_WORD0, word0);
-	if (l2_mode)
-		dbg_inc(DBG_FRAMED);
 
-	if (parse_flow_key(skb, hdr_off, &fk) < 0)
+	if (parse_flow_key(skb, hdr_off, &fk) < 0) {
+		dbg_inc(DBG_FRONT_UNSTEERED);
 		return TC_ACT_OK; /* non-IPv4 / unparseable: pass */
+	}
 
-	if (select_peer(&fk, &peer_id) < 0)
+	rc = select_peer(&fk, &peer_id, &ifindex);
+	if (rc == -1) {
+		dbg_inc(DBG_FRONT_UNSTEERED);
 		return TC_ACT_OK; /* not a steered destination */
-
-	/* Resolve the peer to its wg device in the backend netns. */
-	ifindex = bpf_map_lookup_elem(&peer_dev, &peer_id);
-	if (!ifindex || *ifindex == 0)
-		return TC_ACT_SHOT; /* steered peer has no device: drop */
+	}
+	if (rc < 0) {
+		dbg_inc(DBG_FRONT_NO_PEER);
+		return TC_ACT_SHOT; /* steered, but no usable peer: drop */
+	}
 
 	/*
 	 * NO header stripping here — bpf_redirect does it.  The wg
@@ -385,8 +390,8 @@ int mux_from_front(struct __sk_buff *skb)
 	 * an XDP variant and an in-place copy all delivered packets
 	 * missing exactly their first 14 IP bytes for this reason).
 	 */
-	dbg_inc(DBG_REDIRECTS);
-	return bpf_redirect(*ifindex, 0);
+	dbg_inc(DBG_FRONT_REDIRECTS);
+	return bpf_redirect(ifindex, 0);
 }
 
 /* ------------------------------------------------------------------ */
@@ -398,6 +403,8 @@ int mux_from_wg(struct __sk_buff *skb)
 {
 	struct flow_key fk;
 	struct flow_key rev;
+	struct flow_pin pin;
+	struct peer_info *pd;
 	struct runtime_cfg *cfg;
 	__u32 zero = 0;
 	__u32 back_ifindex;
@@ -414,7 +421,9 @@ int mux_from_wg(struct __sk_buff *skb)
 	 * the reply flow will have in mux_from_front (local -> remote):
 	 * swap addresses and ports.  A later locally-originated packet
 	 * belonging to this flow then hits in flow_peer and returns
-	 * via this peer even if the steering policy has moved on.
+	 * via this peer even if the steering selection has moved on.
+	 * The pin carries the peer's current gen, so a FlushPeer
+	 * (gen bump) invalidates it like any other pin.
 	 */
 	__builtin_memset(&rev, 0, sizeof(rev));
 	rev.saddr = fk.daddr;
@@ -422,7 +431,10 @@ int mux_from_wg(struct __sk_buff *skb)
 	rev.sport = fk.dport;
 	rev.dport = fk.sport;
 	rev.proto = fk.proto;
-	bpf_map_update_elem(&flow_peer, &rev, &own, BPF_ANY);
+	pin.peer_id = own;
+	pd = bpf_map_lookup_elem(&peer_dev, &own);
+	pin.gen = pd ? pd->gen : 0;
+	bpf_map_update_elem(&flow_peer, &rev, &pin, BPF_ANY);
 
 	if (stack_return) {
 		/*

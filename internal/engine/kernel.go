@@ -1,9 +1,13 @@
 package engine
 
 import (
+	"crypto/rand"
+	"encoding/binary"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"net"
+	"sort"
 	"time"
 
 	"github.com/vishvananda/netlink"
@@ -73,35 +77,84 @@ func (e *kernelPeers) adoptSpecs(peers []api.PeerSpec) {
 	}
 }
 
+// tempPeerName returns a unique temporary device name for AddPeer
+// ("wgmt" + 8 hex chars = 12 < IFNAMSIZ).
+func tempPeerName() string {
+	var b [4]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		binary.BigEndian.PutUint32(b[:], uint32(time.Now().UnixNano()))
+	}
+	return "wgmt" + hex.EncodeToString(b[:])
+}
+
+// AddPeer provisions peer spec's WireGuard device. The device is
+// created in the main namespace under a unique temporary name (so
+// it can never collide with — or take over — an existing interface
+// called wg-<peer>), configured there (the UDP sockets' birth
+// namespace), moved into the backend and renamed to wg-<peer>
+// inside it.
 func (e *kernelPeers) AddPeer(spec api.PeerSpec) (peerRef, error) {
 	name := DeviceName(spec.Name)
 	if len(name) >= 16 {
 		return peerRef{}, fmt.Errorf("peer %q: device name %q exceeds IFNAMSIZ", spec.Name, name)
 	}
 	main := e.ctx.Main
-	link, err := main.LinkByName(name)
-	if err != nil {
+	var tmp string
+	for i := 0; ; i++ {
+		tmp = tempPeerName()
 		gl := &netlink.GenericLink{
-			LinkAttrs: netlink.LinkAttrs{Name: name, MTU: e.ctx.MTU},
+			LinkAttrs: netlink.LinkAttrs{Name: tmp, MTU: e.ctx.MTU},
 			LinkType:  "wireguard",
 		}
-		if err := main.LinkAdd(gl); err != nil {
-			return peerRef{}, fmt.Errorf("create %s: %w", name, err)
+		err := main.LinkAdd(gl)
+		if err == nil {
+			break
 		}
-		link = gl
+		if !errors.Is(err, unix.EEXIST) || i >= 5 {
+			return peerRef{}, fmt.Errorf("create wireguard device for %s: %w", spec.Name, err)
+		}
 	}
-	if err := e.configure(name, spec); err != nil {
+	// Until the rename succeeds the device exists only under tmp;
+	// delete it on any failure so nothing leaks.
+	cleanup := func() {
+		if l, err := main.LinkByName(tmp); err == nil {
+			main.LinkDel(l)
+			return
+		}
+		if l, err := e.ctx.Backend.LinkByName(tmp); err == nil {
+			e.ctx.Backend.LinkDel(l)
+		}
+	}
+	if err := e.configure(tmp, spec); err != nil {
+		cleanup()
 		return peerRef{}, err
+	}
+	link, err := main.LinkByName(tmp)
+	if err != nil {
+		cleanup()
+		return peerRef{}, fmt.Errorf("find %s: %w", tmp, err)
 	}
 	// Move to the backend; the UDP sockets keep main as birth namespace.
 	if err := main.LinkSetNsFd(link, int(e.ctx.BackendHandle)); err != nil {
+		cleanup()
 		return peerRef{}, fmt.Errorf("move %s to backend: %w", name, err)
 	}
-	blink, err := e.ctx.Backend.LinkByName(name)
+	blink, err := e.ctx.Backend.LinkByName(tmp)
 	if err != nil {
+		cleanup()
+		return peerRef{}, fmt.Errorf("find %s in backend: %w", tmp, err)
+	}
+	if err := e.ctx.Backend.LinkSetName(blink, name); err != nil {
+		cleanup()
+		return peerRef{}, fmt.Errorf("rename %s to %s in backend: %w", tmp, name, err)
+	}
+	blink, err = e.ctx.Backend.LinkByName(name)
+	if err != nil {
+		cleanup()
 		return peerRef{}, fmt.Errorf("find %s in backend: %w", name, err)
 	}
 	if err := linkSetUpRetry(e.ctx.Backend, blink); err != nil {
+		e.ctx.Backend.LinkDel(blink)
 		return peerRef{}, fmt.Errorf("up %s: %w", name, err)
 	}
 	e.specs[spec.Name] = spec
@@ -194,7 +247,13 @@ func (e *kernelPeers) Peers() ([]api.PeerState, error) {
 		for _, d := range devices {
 			byDevice[d.Name] = d
 		}
-		for _, spec := range e.specs {
+		names := make([]string, 0, len(e.specs))
+		for n := range e.specs {
+			names = append(names, n)
+		}
+		sort.Strings(names)
+		for _, n := range names {
+			spec := e.specs[n]
 			st := api.PeerState{Name: spec.Name, ID: spec.ID}
 			if dev, ok := byDevice[DeviceName(spec.Name)]; ok {
 				for _, p := range dev.Peers {

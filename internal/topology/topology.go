@@ -108,7 +108,13 @@ func (t *Topology) BuildInterconnect() (*datapath.Info, error) {
 		mtu = 1420
 	}
 	front, err := t.Main.LinkByName(spec.FrontName)
-	if err != nil {
+	if err == nil {
+		// Never adopt an unrelated interface that happens to carry
+		// the front's name.
+		if !isPairLink(front) {
+			return nil, fmt.Errorf("refusing to use existing interface %q (type %q) as the mux front: it is not a veth/netkit pair; remove or rename it", spec.FrontName, front.Type())
+		}
+	} else {
 		switch spec.Interconnect {
 		case config.InterconnectVeth:
 			veth := &netlink.Veth{
@@ -145,8 +151,8 @@ func (t *Topology) BuildInterconnect() (*datapath.Info, error) {
 	back, err := t.Backend.LinkByName(BackName)
 	if err != nil {
 		stray, lerr := t.Main.LinkByName(BackName)
-		if lerr != nil {
-			return nil, fmt.Errorf("backend end %s not found in either namespace", BackName)
+		if lerr != nil || !isPairLink(stray) {
+			return nil, fmt.Errorf("backend end %s not found in the backend namespace", BackName)
 		}
 		if err := t.Main.LinkSetNsFd(stray, int(t.nsH)); err != nil {
 			return nil, fmt.Errorf("move %s to backend: %w", BackName, err)
@@ -226,12 +232,93 @@ func (t *Topology) Teardown() error {
 			}
 		}
 	}
-	if front, err := t.Main.LinkByName(t.p.FrontName); err == nil {
+	if front, err := t.Main.LinkByName(t.p.FrontName); err == nil && isPairLink(front) {
 		t.Main.LinkDel(front)
 	}
+	delWireguardLinks(t.Backend)
 	err := netnsutil.DeleteNamed(t.p.BackendNS)
 	t.Backend.Close()
 	t.Main.Close()
 	t.nsH.Close()
 	return err
+}
+
+// isPairLink reports whether l is an interconnect-type link (veth or
+// netkit) — the only link types wgmux ever creates as a front, and so
+// the only ones it may delete or reuse.
+func isPairLink(l netlink.Link) bool {
+	t := l.Type()
+	return t == "veth" || t == "netkit"
+}
+
+// Purge removes an instance's topology WITHOUT live handles: the
+// main-namespace front link (only if it is a veth/netkit; any other
+// same-named link is left alone) and the backend namespace. Routes
+// via the front go away with the link. Idempotent.
+func Purge(backendNS, frontName string) error {
+	main, err := netlink.NewHandle()
+	if err != nil {
+		return err
+	}
+	defer main.Close()
+	if front, err := main.LinkByName(frontName); err == nil && isPairLink(front) {
+		if err := main.LinkDel(front); err != nil {
+			return fmt.Errorf("delete front %s: %w", frontName, err)
+		}
+	}
+	if h, err := netns.GetFromName(backendNS); err == nil {
+		if bh, err := netlink.NewHandleAt(h); err == nil {
+			delWireguardLinks(bh)
+			bh.Close()
+		}
+		h.Close()
+	}
+	return netnsutil.DeleteNamed(backendNS)
+}
+
+// delWireguardLinks deletes every WireGuard device in the namespace
+// behind h, synchronously. A WireGuard device's UDP socket belongs to
+// the namespace it was CREATED in (the main one) and is released only
+// when the device is destroyed; destroying the backend namespace
+// does that asynchronously (kernel cleanup workqueue). Without this,
+// a rebuild or rollback right after a teardown races the old
+// devices for the same listen ports and fails with "address already
+// in use".
+func delWireguardLinks(h *netlink.Handle) {
+	links, err := h.LinkList()
+	if err != nil {
+		return
+	}
+	for _, l := range links {
+		if l.Type() == "wireguard" {
+			h.LinkDel(l)
+		}
+	}
+}
+
+// SetPrefixes updates the set of steered prefixes the main-namespace
+// routes follow (in-place re-apply): routes of removed prefixes are
+// deleted, routes of the new set are (re)installed. Without
+// ManageRoutes only the bookkeeping changes.
+func (t *Topology) SetPrefixes(prefixes []string) error {
+	old := t.p.Prefixes
+	t.p.Prefixes = prefixes
+	if !t.p.ManageRoutes {
+		return nil
+	}
+	backendIP, _, _ := net.ParseCIDR(t.p.BackendAddress)
+	keep := map[string]bool{}
+	for _, c := range prefixes {
+		if _, n, err := net.ParseCIDR(c); err == nil {
+			keep[n.String()] = true
+		}
+	}
+	for _, c := range old {
+		_, dst, err := net.ParseCIDR(c)
+		if err != nil || keep[dst.String()] {
+			continue
+		}
+		t.Main.RouteDel(&netlink.Route{Dst: dst, Gw: backendIP})
+	}
+	return t.AddRoutes()
 }
