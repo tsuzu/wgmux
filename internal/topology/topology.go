@@ -235,6 +235,7 @@ func (t *Topology) Teardown() error {
 	if front, err := t.Main.LinkByName(t.p.FrontName); err == nil && isPairLink(front) {
 		t.Main.LinkDel(front)
 	}
+	delWireguardLinks(t.Backend)
 	err := netnsutil.DeleteNamed(t.p.BackendNS)
 	t.Backend.Close()
 	t.Main.Close()
@@ -265,7 +266,34 @@ func Purge(backendNS, frontName string) error {
 			return fmt.Errorf("delete front %s: %w", frontName, err)
 		}
 	}
+	if h, err := netns.GetFromName(backendNS); err == nil {
+		if bh, err := netlink.NewHandleAt(h); err == nil {
+			delWireguardLinks(bh)
+			bh.Close()
+		}
+		h.Close()
+	}
 	return netnsutil.DeleteNamed(backendNS)
+}
+
+// delWireguardLinks deletes every WireGuard device in the namespace
+// behind h, synchronously. A WireGuard device's UDP socket belongs to
+// the namespace it was CREATED in (the main one) and is released only
+// when the device is destroyed; destroying the backend namespace
+// does that asynchronously (kernel cleanup workqueue). Without this,
+// a rebuild or rollback right after a teardown races the old
+// devices for the same listen ports and fails with "address already
+// in use".
+func delWireguardLinks(h *netlink.Handle) {
+	links, err := h.LinkList()
+	if err != nil {
+		return
+	}
+	for _, l := range links {
+		if l.Type() == "wireguard" {
+			h.LinkDel(l)
+		}
+	}
 }
 
 // SetPrefixes updates the set of steered prefixes the main-namespace
