@@ -18,12 +18,20 @@
 //	    daemon is down; the new daemon ADOPTS the instances (no
 //	    re-apply) and decisions work immediately. (Userspace:
 //	    instances are rebuilt from the spec store — "restored".)
-//	  → failover monitor flips wg-mux when site-a's tunnel dies
+//	  → ECMP on wg-mux2 (YAML: mode ecmp): many parallel short
+//	    connections land on BOTH sites (told apart by the HTTP
+//	    response); weights 3:1 show as 48/16 datapath slots; a
+//	    re-apply keeps the runtime weights, -reset-selections drops
+//	    them; weights survive a daemon restart
+//	  → a runtime activate survives a re-apply of unchanged config
+//	  → failover (wgmuxctl run) with an ESTABLISHED long-lived UDP
+//	    flow pinned to site-a: when site-a dies the flow moves to
+//	    site-b (FlushPeer), not just new connections
 //	  → destroying wg-mux leaves wg-mux2 passing traffic
 //
 // Mux peers are defined by standard wg-quick .conf files handed to
-// `wgmuxctl apply` directly (the primary UX); the YAML file exists
-// only as the failover monitor's policy overlay.
+// `wgmuxctl apply` directly (the primary UX); the YAML file is the
+// overlay for ECMP (wg-mux2) and the failover policy (wg-mux).
 //
 // Run it with:
 //
@@ -78,6 +86,12 @@ const (
 	sitePort2 = 51825 // each site's wg1 listen port (tunnel to wg-mux2)
 
 	markerURL = "http://" + innerIP + ":8080/"
+
+	mux1Files = "/etc/wgmux/mux1/site-a.conf /etc/wgmux/mux1/site-b.conf"
+
+	udpPort       = 9000  // sites answer UDP datagrams with their name
+	udpClientPort = 40000 // the long-lived flow's fixed source port
+	cidr          = innerIP + "/32"
 )
 
 func envOr(key, def string) string {
@@ -217,10 +231,10 @@ func TestE2E(t *testing.T) {
 
 	// Runtime decision on wg-mux: flips wg-mux only; wg-mux2 is
 	// unaffected.
-	l.ctl("activate --name wg-mux " + innerIP + "/32 site-b")
+	l.ctl("activate --name wg-mux " + cidr + " site-b")
 	l.waitMarker("site-b", 90*time.Second)
 	l.marker2MustBe("site-a")
-	l.ctl("activate --name wg-mux " + innerIP + "/32 site-a")
+	l.ctl("activate --name wg-mux " + cidr + " site-a")
 	l.waitMarker("site-a", 90*time.Second)
 
 	// Per-Apply change WITHOUT recreating wg-mux2: re-apply with
@@ -234,6 +248,32 @@ func TestE2E(t *testing.T) {
 		l.t.Fatalf("wg-mux2 was recreated by a re-apply: created %s -> %s", createdBefore, got)
 	}
 	l.t.Logf("wg-mux2 re-applied in place (created still %s)", createdBefore)
+
+	// === ECMP on wg-mux2: the YAML overlay makes the prefix mode ecmp ===
+	l.ctl("apply -c /etc/wgmux/wgmux.yaml --name wg-mux2")
+	l.routeMux2()
+	l.waitBothSites2(120 * time.Second)
+	l.mustStatus("wg-mux2", "mode ecmp")
+	l.mustStatus("wg-mux2", "slots site-a=32 site-b=32")
+	// Weighted 3:1 -> 48/16 slots, and the traffic mix follows.
+	l.ctl("select --name wg-mux2 " + cidr + " site-a=3 site-b=1")
+	l.mustStatus("wg-mux2", "slots site-a=48 site-b=16")
+	counts := l.sampleMarkers("-interface", 120)
+	l.t.Logf("3:1 sample over 120 connections: %v", counts)
+	if counts["site-a"] == 0 || counts["site-b"] == 0 || counts["site-a"] <= counts["site-b"] {
+		l.t.Fatalf("3:1 ECMP mix wrong: %v", counts)
+	}
+	// A re-apply of the unchanged overlay keeps the runtime weights;
+	// -reset-selections returns to the configured (equal) ones.
+	l.ctl("apply -c /etc/wgmux/wgmux.yaml --name wg-mux2")
+	l.routeMux2()
+	l.mustStatus("wg-mux2", "slots site-a=48 site-b=16")
+	l.ctl("apply -c /etc/wgmux/wgmux.yaml --name wg-mux2 --reset-selections")
+	l.routeMux2()
+	l.mustStatus("wg-mux2", "slots site-a=32 site-b=32")
+	// Leave 3:1 in place: it must survive the daemon restart below.
+	l.ctl("select --name wg-mux2 " + cidr + " site-a=3 site-b=1")
+	l.mustStatus("wg-mux2", "slots site-a=48 site-b=16")
 
 	// === Daemon restart: detach, survive (kernel), adopt/restore ===
 	l.t.Logf("$ kill wgmuxd   (SIGTERM = detach only)")
@@ -261,24 +301,44 @@ func TestE2E(t *testing.T) {
 	l.routeMux2()
 	// Adopted/restored instances serve traffic and decisions at once.
 	l.waitMarker("site-a", 60*time.Second)
-	l.waitMarker2("site-b", 60*time.Second)
-	l.ctl("activate --name wg-mux " + innerIP + "/32 site-b")
+	// The runtime ECMP weights came back with the instance.
+	l.mustStatus("wg-mux2", "slots site-a=48 site-b=16")
+	l.waitBothSites2(60 * time.Second)
+	l.ctl("activate --name wg-mux " + cidr + " site-b")
 	l.waitMarker("site-b", 60*time.Second)
-	l.ctl("activate --name wg-mux " + innerIP + "/32 site-a")
+	// A re-apply of unchanged config keeps the runtime selection...
+	l.ctl("apply --name wg-mux " + mux1Files)
+	l.mustStatus("wg-mux", "selection site-b:1")
+	l.waitMarker("site-b", 30*time.Second)
+	// ...until it is explicitly reset to the configured one.
+	l.ctl("apply --name wg-mux --reset-selections " + mux1Files)
+	l.mustStatus("wg-mux", "selection site-a:1")
 	l.waitMarker("site-a", 60*time.Second)
 
-	// Failover on wg-mux (the monitor's policy lives in the YAML
-	// overlay): killing site-a's wg-mux tunnel must move wg-mux
-	// flows to site-b once the handshake ages past 150s. wg-mux2's
-	// active is site-b already, so it stays reachable throughout.
-	l.t.Logf("$ wgmuxctl monitor -c /etc/wgmux/wgmux.yaml &")
-	l.execBg(muxNode, "nohup wgmuxctl monitor -c /etc/wgmux/wgmux.yaml >/var/log/monitor.log 2>&1 &")
+	// Failover on wg-mux, driven by the policy runner (`wgmuxctl
+	// run`): killing site-a's wg-mux tunnel must move wg-mux flows to
+	// site-b once the handshake ages past 150s — INCLUDING an
+	// established long-lived flow, which only moves because the
+	// runner flushes the dead peer's flow pins. Apply the overlay
+	// first so the daemon reports policy failover (the selection,
+	// site-a, is unchanged and kept).
+	l.ctl("apply -c /etc/wgmux/wgmux.yaml --name wg-mux")
+	l.mustStatus("wg-mux", "policy failover")
+	l.mustStatus("wg-mux", "selection site-a:1")
+	l.startUDPProbe()
+	l.waitUDPTail("site-a", 60*time.Second)
+	l.t.Logf("$ wgmuxctl run -c /etc/wgmux/wgmux.yaml &")
+	l.execBg(muxNode, "nohup wgmuxctl run -c /etc/wgmux/wgmux.yaml >/var/log/policy.log 2>&1 &")
 	l.exec(siteANode, "ip link set wg0 down")
 	l.waitMarker("site-b", 300*time.Second)
+	l.mustStatus("wg-mux", "selection site-b:1")
+	l.waitUDPTail("site-b", 60*time.Second)
+	l.t.Logf("established UDP flow moved to site-b after site-a died")
+	l.exec(muxNode, "pkill -f udpprobe.py || true")
 
 	// Destroying wg-mux leaves wg-mux2 passing traffic.
 	l.ctl("destroy --name wg-mux")
-	l.waitMarker2("site-b", 60*time.Second)
+	l.waitBothSites2(60 * time.Second)
 	if out, err := l.execOK(muxNode, "wgmuxctl status"); err != nil || strings.Contains(out, "mux wg-mux (") {
 		l.t.Fatalf("wg-mux still listed after destroy: err=%v\n%s", err, out)
 	}
@@ -361,6 +421,17 @@ func (l *lab) setupSite(node, name, outer string, priv wgtypes.Key, mux1Port, mu
 	// management default route instead of the tunnels.
 	l.exec(node, "ip route add "+mux1Inner+"/32 dev wg0 && ip route add "+mux2Inner+"/32 dev wg1")
 	l.exec(node, "mkdir -p /srv && printf '"+name+"\\n' > /srv/index.html")
+	// UDP responder (answers with the site name): the target of the
+	// long-lived flow in the failover scenario.
+	l.exec(node, "cat > /tmp/udpecho.py <<'EOF'\n"+
+		"import socket\n"+
+		"s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)\n"+
+		fmt.Sprintf("s.bind((%q, %d))\n", innerIP, udpPort)+
+		"while True:\n"+
+		"    d, a = s.recvfrom(100)\n"+
+		fmt.Sprintf("    s.sendto(b%q, a)\n", name+"\n")+
+		"EOF")
+	l.execBg(node, "nohup python3 /tmp/udpecho.py >/var/log/udpecho.log 2>&1 &")
 	l.execBg(node, "nohup python3 -m http.server 8080 --bind "+innerIP+" --directory /srv >/var/log/http.log 2>&1 &")
 	// Keep both tunnels warm so handshakes stay fresh: the failover
 	// monitor judges candidates by handshake age. Only the SITES
@@ -405,9 +476,9 @@ func (l *lab) setupMux() {
 	write("/etc/wgmux/mux2/site-a.conf", wgConf(mux2PortA, l.mux2Priv, mux2Inner, l.siteAPriv.PublicKey(), siteOuterA+":"+fmt.Sprint(sitePort2)))
 	write("/etc/wgmux/mux2/site-b.conf", wgConf(mux2PortB, l.mux2Priv, mux2Inner, l.siteBPriv.PublicKey(), siteOuterB+":"+fmt.Sprint(sitePort2)))
 
-	// The YAML overlay exists ONLY to give the failover monitor its
-	// policy for wg-mux; the instance itself is created/applied
-	// from the conf files below.
+	// The YAML overlay: failover policy for wg-mux and an ECMP prefix
+	// for wg-mux2. The instances themselves are first created from
+	// the conf files below; the overlay is applied over them later.
 	write("/etc/wgmux/wgmux.yaml", fmt.Sprintf(`api_socket: /run/wgmux/wgmuxd.sock
 muxes:
   - name: wg-mux
@@ -415,11 +486,18 @@ muxes:
       - {name: site-a, wg_config: /etc/wgmux/mux1/site-a.conf}
       - {name: site-b, wg_config: /etc/wgmux/mux1/site-b.conf}
     prefixes:
-      - {cidr: %s/32, policy: failover}
+      - {cidr: %s, policy: failover}
     failover:
       handshake_max_age_seconds: 150
       interval_seconds: 5
-`, innerIP))
+  - name: wg-mux2
+    manage_routes: false
+    peers:
+      - {name: site-a, wg_config: /etc/wgmux/mux2/site-a.conf}
+      - {name: site-b, wg_config: /etc/wgmux/mux2/site-b.conf}
+    prefixes:
+      - {cidr: %s, mode: ecmp}
+`, cidr, cidr))
 
 	l.startDaemon()
 
@@ -541,6 +619,95 @@ func (l *lab) marker2MustBe(want string) {
 	if err != nil || got != want {
 		l.t.Fatalf("wg-mux2 marker = %q err %v, want %q (instance isolation broken?)", got, err, want)
 	}
+}
+
+// mustStatus asserts `wgmuxctl status --name <mux>` contains want
+// (polling briefly: selections settle asynchronously on userspace).
+func (l *lab) mustStatus(mux, want string) {
+	l.t.Helper()
+	var last string
+	for i := 0; i < 10; i++ {
+		out, err := l.execOK(muxNode, "wgmuxctl status --name "+mux)
+		last = out
+		if err == nil && strings.Contains(out, want) {
+			return
+		}
+		time.Sleep(time.Second)
+	}
+	l.t.Fatalf("status of %s does not contain %q:\n%s", mux, want, last)
+}
+
+// sampleMarkers opens n short HTTP connections (20 in parallel,
+// each a fresh source port, hence a fresh flow hash) and counts the
+// responding sites. A non-empty bindIface means "through wg-mux2".
+func (l *lab) sampleMarkers(bindIface string, n int) map[string]int {
+	bind := ""
+	if bindIface != "" {
+		bind = "--interface " + mux2Inner + " "
+	}
+	script := fmt.Sprintf("seq 1 %d | xargs -P 20 -I{} sh -c 'curl -s --max-time 5 %s%s; echo'", n, bind, markerURL)
+	out, _ := l.execOK(muxNode, script)
+	counts := map[string]int{}
+	for _, line := range strings.Split(out, "\n") {
+		if line = strings.TrimSpace(line); line != "" {
+			counts[line]++
+		}
+	}
+	return counts
+}
+
+// waitBothSites2 waits until parallel connections through wg-mux2
+// are answered by BOTH sites.
+func (l *lab) waitBothSites2(timeout time.Duration) {
+	l.t.Helper()
+	waitFor(l.t, "wg-mux2 ECMP reaching both sites", timeout, 3*time.Second, func() bool {
+		c := l.sampleMarkers("-interface", 60)
+		l.t.Logf("wg-mux2 ECMP sample: %v", c)
+		return c["site-a"] > 0 && c["site-b"] > 0
+	})
+}
+
+// startUDPProbe starts the long-lived flow: one fixed 5-tuple
+// (mux1 front address:udpClientPort -> inner IP:udpPort), one
+// datagram every 500ms, each reply's site name appended to a log.
+func (l *lab) startUDPProbe() {
+	l.t.Helper()
+	l.exec(muxNode, "cat > /tmp/udpprobe.py <<'EOF'\n"+
+		"import socket, time\n"+
+		"s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)\n"+
+		fmt.Sprintf("s.bind((%q, %d))\n", mux1Inner, udpClientPort)+
+		"s.settimeout(0.4)\n"+
+		"while True:\n"+
+		fmt.Sprintf("    s.sendto(b'x', (%q, %d))\n", innerIP, udpPort)+
+		"    try:\n"+
+		"        r = s.recvfrom(100)[0].decode().strip()\n"+
+		"    except socket.timeout:\n"+
+		"        r = 'timeout'\n"+
+		"    open('/tmp/udp.log', 'a').write(r + '\\n')\n"+
+		"    time.sleep(0.1)\n"+
+		"EOF")
+	l.exec(muxNode, "rm -f /tmp/udp.log; touch /tmp/udp.log")
+	l.execBg(muxNode, "nohup python3 /tmp/udpprobe.py >/var/log/udpprobe.log 2>&1 &")
+}
+
+// waitUDPTail waits until the long-lived flow's most recent replies
+// all come from `want`.
+func (l *lab) waitUDPTail(want string, timeout time.Duration) {
+	l.t.Helper()
+	waitFor(l.t, "long-lived UDP flow answered by "+want, timeout, 2*time.Second, func() bool {
+		out, _ := l.execOK(muxNode, "tail -n 5 /tmp/udp.log")
+		lines := strings.Fields(out)
+		ok := len(lines) == 5
+		for _, ln := range lines {
+			if ln != want {
+				ok = false
+			}
+		}
+		if !ok {
+			l.t.Logf("udp flow tail: %v (want all %s)", lines, want)
+		}
+		return ok
+	})
 }
 
 // waitMarkerDiag is waitMarker plus, on timeout, a full datapath

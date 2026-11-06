@@ -27,6 +27,8 @@ import (
 	"strings"
 
 	"gopkg.in/yaml.v3"
+
+	"github.com/tsuzu/wgmux/internal/api"
 )
 
 const (
@@ -36,10 +38,26 @@ const (
 	AttachTCX = "tcx"
 	AttachTC  = "tc"
 
-	PolicyActive   = "active"
-	PolicyHash     = "hash"
+	// Prefix policies: WHO changes a prefix's selection at runtime.
+	PolicyStatic   = "static"
 	PolicyFailover = "failover"
 	PolicyBGP      = "bgp"
+	// Legacy policy spellings, still accepted: "active" is
+	// static+single, "hash" is static+ecmp. They are normalized
+	// away at load time; EffectivePrefixes never carry them.
+	PolicyActive = "active"
+	PolicyHash   = "hash"
+
+	// Prefix modes: how many candidates carry the prefix at once.
+	ModeSingle = "single"
+	ModeECMP   = "ecmp"
+
+	// MaxCandidates is the slot-table size (steer.Slots): more
+	// candidates than slots could not each own a slot.
+	MaxCandidates = 64
+	// MaxPeerID is the datapath peer-id ceiling (peer_dev has 256
+	// entries; 0 means "no peer").
+	MaxPeerID = 255
 
 	EngineKernel    = "kernel"
 	EngineUserspace = "userspace"
@@ -138,13 +156,69 @@ func (p *Peer) Allowed() []string { return p.allowed }
 type Prefix struct {
 	CIDR string `yaml:"cidr"`
 	// Candidates are peer names that all carry this prefix in their
-	// AllowedIPs. The datapath selects exactly one of them per packet.
+	// AllowedIPs. At most 64 (the datapath's slot-table size).
 	Candidates []string `yaml:"candidates"`
-	// Active names the initially selected candidate (policies active and
-	// failover). Defaults to the first candidate.
-	Active string `yaml:"active"`
-	// Policy: active | hash | failover | bgp. Defaults to active.
+	// Mode: single | ecmp. single (default) sends all new flows to
+	// one selected candidate; ecmp spreads them by flow hash over
+	// the selected candidates in proportion to their weights.
+	Mode string `yaml:"mode"`
+	// Policy: static | failover | bgp (default static) — who changes
+	// the selection at runtime. Legacy: active = static+single,
+	// hash = static+ecmp.
 	Policy string `yaml:"policy"`
+	// Active names the initially selected candidate (mode single
+	// only). Defaults to the first candidate.
+	Active string `yaml:"active"`
+	// Weights is the initial ECMP selection: peer -> positive
+	// weight. Keys must be candidates; a candidate left out is not
+	// initially selected. Default (mode ecmp): every candidate,
+	// weight 1. Not allowed in mode single.
+	Weights map[string]int `yaml:"weights"`
+}
+
+// Selection returns the prefix's configured (initial) selection in
+// candidate order: the single Active peer, or the ECMP members with
+// their weights (all candidates at weight 1 when no weights are set).
+func (p Prefix) Selection() []api.PeerWeight {
+	if p.Mode != ModeECMP {
+		if p.Active == "" {
+			return nil
+		}
+		return []api.PeerWeight{{Peer: p.Active, Weight: 1}}
+	}
+	var out []api.PeerWeight
+	for _, c := range p.Candidates {
+		if len(p.Weights) == 0 {
+			out = append(out, api.PeerWeight{Peer: c, Weight: 1})
+		} else if w, ok := p.Weights[c]; ok {
+			out = append(out, api.PeerWeight{Peer: c, Weight: uint32(w)})
+		}
+	}
+	return out
+}
+
+// normalizeModePolicy maps the legacy policy spellings and applies
+// the mode/policy defaults. It does not look at candidates.
+func (p *Prefix) normalizeModePolicy() error {
+	implied := ""
+	switch p.Policy {
+	case PolicyActive:
+		p.Policy, implied = PolicyStatic, ModeSingle
+	case PolicyHash:
+		p.Policy, implied = PolicyStatic, ModeECMP
+	case "":
+		p.Policy = PolicyStatic
+	}
+	if implied != "" && p.Mode != "" && p.Mode != implied {
+		return fmt.Errorf("legacy policy implies mode %s but mode is %s", implied, p.Mode)
+	}
+	if p.Mode == "" {
+		p.Mode = implied
+	}
+	if p.Mode == "" {
+		p.Mode = ModeSingle
+	}
+	return nil
 }
 
 type Failover struct {
@@ -588,11 +662,12 @@ func (m *Mux) resolvePrefixes() error {
 	if !anyDeclared {
 		m.EffectivePrefixes = m.Prefixes
 		for i := range m.EffectivePrefixes {
-			if m.EffectivePrefixes[i].Policy == "" {
-				m.EffectivePrefixes[i].Policy = PolicyActive
+			p := &m.EffectivePrefixes[i]
+			if err := p.normalizeModePolicy(); err != nil {
+				return fmt.Errorf("mux %q: prefix %q: %w", m.Name, p.CIDR, err)
 			}
-			if m.EffectivePrefixes[i].Active == "" && len(m.EffectivePrefixes[i].Candidates) > 0 {
-				m.EffectivePrefixes[i].Active = m.EffectivePrefixes[i].Candidates[0]
+			if p.Mode == ModeSingle && p.Active == "" && len(p.Candidates) > 0 {
+				p.Active = p.Candidates[0]
 			}
 		}
 		return nil
@@ -609,11 +684,14 @@ func (m *Mux) resolvePrefixes() error {
 			return fmt.Errorf("duplicate prefix override %q", ov.CIDR)
 		}
 		ov.CIDR = key
+		if err := ov.normalizeModePolicy(); err != nil {
+			return fmt.Errorf("mux %q: prefix override %q: %w", m.Name, ov.CIDR, err)
+		}
 		overrides[key] = ov
 	}
 	var eff []Prefix
 	for _, c := range claims {
-		np := Prefix{CIDR: c.cidr, Candidates: c.peers, Active: c.peers[0], Policy: PolicyActive}
+		np := Prefix{CIDR: c.cidr, Candidates: c.peers, Mode: ModeSingle, Policy: PolicyStatic}
 		if ov, ok := overrides[c.cidr]; ok {
 			delete(overrides, c.cidr)
 			if len(ov.Candidates) > 0 {
@@ -629,14 +707,16 @@ func (m *Mux) resolvePrefixes() error {
 					}
 				}
 				np.Candidates = ov.Candidates
-				np.Active = ov.Candidates[0]
 			}
-			if ov.Active != "" {
-				np.Active = ov.Active
-			}
-			if ov.Policy != "" {
-				np.Policy = ov.Policy
-			}
+			// Overrides were normalized: Mode/Policy are always set
+			// (defaults single/static), so they simply win.
+			np.Mode = ov.Mode
+			np.Policy = ov.Policy
+			np.Active = ov.Active
+			np.Weights = ov.Weights
+		}
+		if np.Mode == ModeSingle && np.Active == "" {
+			np.Active = np.Candidates[0]
 		}
 		eff = append(eff, np)
 	}
@@ -766,6 +846,9 @@ func (m *Mux) validate() error {
 			return fmt.Errorf("mux %q: duplicate peer name %q", m.Name, p.Name)
 		}
 		seenNames[p.Name] = true
+		if p.ID < 1 || p.ID > MaxPeerID {
+			return fmt.Errorf("mux %q: peer %q: id %d out of range 1..%d", m.Name, p.Name, p.ID, MaxPeerID)
+		}
 		if prev, dup := seenIDs[p.ID]; dup {
 			return fmt.Errorf("mux %q: peer id %d used by both %q and %q", m.Name, p.ID, prev, p.Name)
 		}
@@ -831,30 +914,49 @@ func (m *Mux) validate() error {
 		if len(p.Candidates) == 0 {
 			return fmt.Errorf("mux %q: prefix %q: no candidates", m.Name, p.CIDR)
 		}
-		if len(p.Candidates) > 4 {
-			return fmt.Errorf("mux %q: prefix %q: at most 4 candidates (datapath limit)", m.Name, p.CIDR)
+		if len(p.Candidates) > MaxCandidates {
+			return fmt.Errorf("mux %q: prefix %q: %d candidates, at most %d (datapath slot-table size)", m.Name, p.CIDR, len(p.Candidates), MaxCandidates)
 		}
+		isCand := map[string]bool{}
 		for _, cand := range p.Candidates {
 			if m.PeerByName(cand) == nil {
 				return fmt.Errorf("mux %q: prefix %q: candidate %q is not a defined peer", m.Name, p.CIDR, cand)
 			}
-		}
-		if m.PeerByName(p.Active) == nil {
-			return fmt.Errorf("mux %q: prefix %q: active peer %q is not defined", m.Name, p.CIDR, p.Active)
-		}
-		activeOK := false
-		for _, cand := range p.Candidates {
-			if cand == p.Active {
-				activeOK = true
+			if isCand[cand] {
+				return fmt.Errorf("mux %q: prefix %q: candidate %q listed twice", m.Name, p.CIDR, cand)
 			}
-		}
-		if !activeOK {
-			return fmt.Errorf("mux %q: prefix %q: active peer %q is not one of its candidates", m.Name, p.CIDR, p.Active)
+			isCand[cand] = true
 		}
 		switch p.Policy {
-		case PolicyActive, PolicyHash, PolicyFailover, PolicyBGP:
+		case PolicyStatic, PolicyFailover, PolicyBGP:
 		default:
-			return fmt.Errorf("mux %q: prefix %q: policy must be active, hash, failover or bgp, got %q", m.Name, p.CIDR, p.Policy)
+			return fmt.Errorf("mux %q: prefix %q: policy must be static, failover or bgp (legacy: active, hash), got %q", m.Name, p.CIDR, p.Policy)
+		}
+		switch p.Mode {
+		case ModeSingle:
+			if len(p.Weights) > 0 {
+				return fmt.Errorf("mux %q: prefix %q: weights are only valid in mode ecmp", m.Name, p.CIDR)
+			}
+			if m.PeerByName(p.Active) == nil {
+				return fmt.Errorf("mux %q: prefix %q: active peer %q is not defined", m.Name, p.CIDR, p.Active)
+			}
+			if !isCand[p.Active] {
+				return fmt.Errorf("mux %q: prefix %q: active peer %q is not one of its candidates", m.Name, p.CIDR, p.Active)
+			}
+		case ModeECMP:
+			if p.Active != "" {
+				return fmt.Errorf("mux %q: prefix %q: active is only valid in mode single (use weights for ecmp)", m.Name, p.CIDR)
+			}
+			for peer, w := range p.Weights {
+				if !isCand[peer] {
+					return fmt.Errorf("mux %q: prefix %q: weight for %q, which is not a candidate", m.Name, p.CIDR, peer)
+				}
+				if w <= 0 || w > 65535 {
+					return fmt.Errorf("mux %q: prefix %q: weight for %q must be in 1..65535, got %d", m.Name, p.CIDR, peer, w)
+				}
+			}
+		default:
+			return fmt.Errorf("mux %q: prefix %q: mode must be single or ecmp, got %q", m.Name, p.CIDR, p.Mode)
 		}
 		if p.Policy == PolicyBGP && m.BGP.Mode == BGPModeNone {
 			return fmt.Errorf("mux %q: prefix %q: policy bgp but bgp.mode is none", m.Name, p.CIDR)

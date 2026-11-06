@@ -5,10 +5,10 @@
 #
 # hands wgmuxd your existing wg-quick files and produces the same
 # result as the first mux below (peers derived from the files,
-# prefixes derived from their AllowedIPs, default policy "active"
-# with the first file active). Reach for YAML when you want
-# policies (failover / bgp / hash), several muxes in one file, or
-# inline peers. In YAML form a peer can still reference a wg-quick
+# prefixes derived from their AllowedIPs, default mode "single",
+# policy "static", the first file active). Reach for YAML when you
+# want ECMP / weights, policies (failover / bgp), several muxes in
+# one file, or inline peers. In YAML form a peer can still reference a wg-quick
 # file with wg_config: — the file is used as-is.
 #
 # wgmuxd must be running first; its startup flags choose the engine
@@ -18,6 +18,19 @@
 #          -socket /run/wgmux/wgmuxd.sock -state-dir /var/lib/wgmux
 #
 # (contrib/wgmuxd.service is a ready systemd unit.)
+#
+# Per-prefix knobs (all optional, defaults single / static):
+#   mode:    single | ecmp     one selected peer / flows spread over several
+#   policy:  static | failover | bgp
+#                              who changes the selection at runtime
+#                              (legacy: active = static+single, hash = static+ecmp)
+#   active:  <peer>            initial peer (mode single; default: first candidate)
+#   weights: {peer: n}         initial ECMP selection (mode ecmp; default all, 1 each)
+#
+# Policies run in `wgmuxctl run -c wgmux.yaml` (one process for every
+# mux in this file; contrib/wgmux-policy.service is the systemd unit).
+# Runtime selections made by `wgmuxctl activate|select`, failover or
+# BGP survive a re-apply; `wgmuxctl apply -reset-selections` drops them.
 
 api_socket: /run/wgmux/wgmuxd.sock
 
@@ -37,10 +50,21 @@ muxes:
     # (they must agree); set them here to override.
     # front: {address: 10.200.0.2/24, mtu: 1420}
     # Prefixes are DERIVED from the peers' AllowedIPs; this list
-    # only overrides policy/active per CIDR.
+    # only overrides mode/policy/active/weights per CIDR.
     prefixes:
+      # Single active site with automatic failover: site-a carries
+      # traffic until its handshake goes stale, then site-b (no
+      # preemption back); the dead peer's established flows are
+      # flushed so they move too.
       - cidr: 10.20.0.10/32
-        policy: failover # active | hash | failover | bgp
+        policy: failover
+        active: site-a
+      # ECMP across both sites, 3:1, dropping a dead site and
+      # re-adding it (with its weight) on recovery:
+      # - cidr: 192.168.10.0/24
+      #   mode: ecmp
+      #   policy: failover
+      #   weights: {site-a: 3, site-b: 1}
     failover:
       handshake_max_age_seconds: 150
       interval_seconds: 15
@@ -71,9 +95,11 @@ muxes:
     prefixes:
       # Overrides over the derived prefixes:
       - cidr: 192.168.10.0/24
-        policy: hash # spread flows across both sites
-      # A prefix whose active peer follows BGP best paths:
+        mode: ecmp # spread flows across both sites (equal weights)
+      # A prefix whose selection follows BGP paths (single: best
+      # path; ecmp: the whole multipath set with bgp.mode frr):
       # - cidr: 172.16.0.0/24
+      #   mode: ecmp
       #   policy: bgp
     # manage_routes: false # let FRR/zebra own the routes instead
     bgp:

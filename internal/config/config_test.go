@@ -63,7 +63,7 @@ func TestLegacyShorthandDefaults(t *testing.T) {
 		t.Errorf("peer IDs not assigned in order: %d, %d", m.Peers[0].ID, m.Peers[1].ID)
 	}
 	p := m.EffectivePrefixes[0]
-	if p.Policy != PolicyActive || p.Active != "site-a" {
+	if p.Policy != PolicyStatic || p.Mode != ModeSingle || p.Active != "site-a" {
 		t.Errorf("prefix defaults wrong: policy=%q active=%q", p.Policy, p.Active)
 	}
 	if got := m.AllowedIPsFor("site-b"); len(got) != 1 || got[0] != "10.20.0.10/32" {
@@ -172,7 +172,7 @@ func TestMuxFromWGFilesDerivation(t *testing.T) {
 		t.Fatalf("effective prefixes = %+v", m.EffectivePrefixes)
 	}
 	shared := m.EffectivePrefixes[0]
-	if shared.CIDR != "10.20.0.10/32" || len(shared.Candidates) != 2 || shared.Active != "site-a" || shared.Policy != PolicyActive {
+	if shared.CIDR != "10.20.0.10/32" || len(shared.Candidates) != 2 || shared.Active != "site-a" || shared.Policy != PolicyStatic {
 		t.Errorf("shared prefix = %+v", shared)
 	}
 	solo := m.EffectivePrefixes[1]
@@ -227,7 +227,7 @@ muxes:
       - {name: site-a, wg_config: site-a.conf}
       - {name: site-b, wg_config: site-b.conf}
     prefixes:
-      - {cidr: 10.20.0.10/32, policy: hash}
+      - {cidr: 10.20.0.10/32, mode: ecmp}
 `
 	path := filepath.Join(dir, "wgmux.yaml")
 	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
@@ -242,12 +242,12 @@ muxes:
 		t.Errorf("front derived = %q", m.Front.Address)
 	}
 	p := m.EffectivePrefixes[0]
-	if p.Policy != PolicyHash || len(p.Candidates) != 2 {
+	if p.Mode != ModeECMP || len(p.Candidates) != 2 {
 		t.Errorf("override not applied: %+v", p)
 	}
 
 	// Override naming a peer that does not claim the prefix.
-	bad := strings.Replace(body, "policy: hash", "candidates: [site-a, ghost], policy: hash", 1)
+	bad := strings.Replace(body, "mode: ecmp", "candidates: [site-a, ghost], mode: ecmp", 1)
 	os.WriteFile(path, []byte(bad), 0o600)
 	if _, err := Load(path); err == nil {
 		t.Error("override with non-claiming candidate accepted")
