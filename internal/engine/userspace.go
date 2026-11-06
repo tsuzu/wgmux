@@ -5,9 +5,11 @@ import (
 	"encoding/hex"
 	"fmt"
 	"net"
+	"reflect"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/vishvananda/netlink"
@@ -42,12 +44,15 @@ type userspaceMux struct {
 	byName   map[string]*userspacePeer
 	table    *steer.Table
 	flows    *flowTable
+	sel      map[string][]api.PeerWeight // canonical CIDR -> current selection
 	counters pumpCounters
 	stop     chan struct{}
 	wg       sync.WaitGroup
 }
 
 type userspacePeer struct {
+	id   uint32
+	gen  atomic.Uint32 // pin generation; FlushPeer bumps it
 	spec api.PeerSpec
 	dev  *device.Device
 	vt   *chanTUN
@@ -69,6 +74,11 @@ func (m *userspaceMux) frontName() string {
 func (m *userspaceMux) Apply(spec api.ApplySpec) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	if m.spec != nil && reflect.DeepEqual(m.spec.Front, spec.Front) &&
+		m.spec.ManageRoutes == spec.ManageRoutes &&
+		reflect.DeepEqual(m.spec.Peers, spec.Peers) {
+		return m.applyInPlaceLocked(spec)
+	}
 	if m.spec != nil {
 		if err := m.closeLocked(); err != nil {
 			return fmt.Errorf("replace existing state: %w", err)
@@ -79,6 +89,10 @@ func (m *userspaceMux) Apply(spec api.ApplySpec) error {
 		mtu = 1420
 	}
 	entries, err := steer.EntriesFromSpec(spec.Prefixes, PeerIDs(spec), nil)
+	if err != nil {
+		return err
+	}
+	sel, err := selectionsOf(spec)
 	if err != nil {
 		return err
 	}
@@ -149,8 +163,8 @@ func (m *userspaceMux) Apply(spec api.ApplySpec) error {
 	}
 	for _, pspec := range spec.Peers {
 		vt := newChanTUN("wgmux-go-"+pspec.Name, mtu)
-		peerID := pspec.ID
-		vt.onWrite = func(pkt []byte) { m.fromPeer(front, flows, peerID, pkt) }
+		p := &userspacePeer{id: pspec.ID, spec: pspec, vt: vt}
+		vt.onWrite = func(pkt []byte) { m.fromPeer(front, flows, p, pkt) }
 		dev := device.NewDevice(vt, conn.NewDefaultBind(), device.NewLogger(device.LogLevelError, "wgmux-go "+pspec.Name+": "))
 		uapi, err := buildUAPI(pspec)
 		if err != nil {
@@ -165,7 +179,7 @@ func (m *userspaceMux) Apply(spec api.ApplySpec) error {
 			dev.Close()
 			return fail(fmt.Errorf("up wireguard-go %s: %w", pspec.Name, err))
 		}
-		p := &userspacePeer{spec: pspec, dev: dev, vt: vt}
+		p.dev = dev
 		peers[pspec.ID] = p
 		byName[pspec.Name] = p
 	}
@@ -177,6 +191,7 @@ func (m *userspaceMux) Apply(spec api.ApplySpec) error {
 	m.byName = byName
 	m.table = table
 	m.flows = flows
+	m.sel = sel
 	m.stop = make(chan struct{})
 	m.wg.Add(1)
 	go m.frontLoop(front, peers, table, flows, m.stop)
@@ -187,33 +202,42 @@ func (m *userspaceMux) Apply(spec api.ApplySpec) error {
 
 // forwardFromFront steers one plaintext packet read from the front
 // TUN to its peer, mirroring the BPF mux_from_front + select_peer:
-// flow pin wins, else the steering table decides and the choice is
-// recorded. Unsteered destinations are dropped (the front is a
+// a flow pin wins if it is valid (its peer exists and the peer's
+// generation still equals the pin's), else the steering table
+// decides and the choice is pinned with the peer's current
+// generation. Unsteered destinations are dropped (the front is a
 // dead end; the kernel datapath passes such packets into a backend
 // stack that has nowhere for them either).
 func (m *userspaceMux) forwardFromFront(pkt []byte, peers map[uint32]*userspacePeer, table *steer.Table, flows *flowTable) {
 	m.counters.frontEntries.Add(1)
 	fk, ok := parseFlow(pkt)
 	if !ok {
-		m.counters.frontDrops.Add(1)
+		m.counters.frontUnsteered.Add(1)
 		return
 	}
-	peerID, pinned := flows.get(fk)
-	if !pinned {
+	var p *userspacePeer
+	if pin, found := flows.get(fk); found {
+		if pp := peers[pin.peer]; pp != nil && pp.gen.Load() == pin.gen {
+			p = pp
+			m.counters.frontPinHits.Add(1)
+		} else {
+			m.counters.frontPinStale.Add(1)
+		}
+	}
+	if p == nil {
 		entry, ok := table.Lookup(net.IP(pkt[16:20]))
 		if !ok {
-			m.counters.frontDrops.Add(1)
+			m.counters.frontUnsteered.Add(1)
 			return
 		}
-		peerID = entry.Pick(fk)
-		if peerID == steer.NoPeer {
-			m.counters.frontDrops.Add(1)
+		p = peers[entry.Pick(fk)]
+		if p == nil { // NoPeer slot or unknown peer ID
+			m.counters.frontNoPeer.Add(1)
 			return
 		}
-		flows.put(fk, peerID)
+		flows.put(fk, flowVal{peer: p.id, gen: p.gen.Load()})
 	}
-	p := peers[peerID]
-	if p == nil || !p.vt.enqueue(pkt) {
+	if !p.vt.enqueue(pkt) {
 		m.counters.frontDrops.Add(1)
 		return
 	}
@@ -230,12 +254,12 @@ func (m *userspaceMux) forwardFromFront(pkt []byte, peers map[uint32]*userspaceP
 const tunWriteHeadroom = 16
 
 // fromPeer handles one decrypted packet arriving from a peer: pin
-// the reverse flow (as mux_from_wg does) and write the packet to
-// the front TUN.
-func (m *userspaceMux) fromPeer(front tun.Device, flows *flowTable, peerID uint32, pkt []byte) {
+// the reverse flow to the peer with its current generation (as
+// mux_from_wg does) and write the packet to the front TUN.
+func (m *userspaceMux) fromPeer(front tun.Device, flows *flowTable, p *userspacePeer, pkt []byte) {
 	m.counters.wgEntries.Add(1)
 	if fk, ok := parseFlow(pkt); ok {
-		flows.put(fk.Reverse(), peerID)
+		flows.put(fk.Reverse(), flowVal{peer: p.id, gen: p.gen.Load()})
 	}
 	buf := make([]byte, tunWriteHeadroom+len(pkt))
 	copy(buf[tunWriteHeadroom:], pkt)
@@ -281,16 +305,193 @@ func (m *userspaceMux) frontLoop(front tun.Device, peers map[uint32]*userspacePe
 	}
 }
 
-func (m *userspaceMux) SetSelection(prefix *net.IPNet, sel []api.PeerWeight) error {
-	return errTODO // userspace engine workstream
+// selectionsOf records every prefix's effective selection by
+// canonical CIDR.
+func selectionsOf(spec api.ApplySpec) (map[string][]api.PeerWeight, error) {
+	out := make(map[string][]api.PeerWeight, len(spec.Prefixes))
+	for _, p := range spec.Prefixes {
+		_, ipnet, err := net.ParseCIDR(p.CIDR)
+		if err != nil {
+			return nil, fmt.Errorf("prefix %q: %w", p.CIDR, err)
+		}
+		out[ipnet.String()] = append([]api.PeerWeight(nil), p.EffectiveSelection()...)
+	}
+	return out, nil
 }
 
+// prevSlots snapshots the table's current slot tables by key.
+func prevSlots(t *steer.Table) map[steer.SteeringKey]steer.SlotTable {
+	out := map[steer.SteeringKey]steer.SlotTable{}
+	for _, e := range t.Entries() {
+		out[e.Key()] = e.Slots
+	}
+	return out
+}
+
+// applyInPlaceLocked re-applies a spec whose Front, ManageRoutes
+// and Peers are unchanged: only the steering entries (compiled
+// against the current slots, so staying peers keep their slots) and
+// the routes of added/removed prefixes change. No device, TUN or
+// pump churn; flow pins survive. Caller holds m.mu.
+func (m *userspaceMux) applyInPlaceLocked(spec api.ApplySpec) error {
+	entries, err := steer.EntriesFromSpec(spec.Prefixes, PeerIDs(spec), prevSlots(m.table))
+	if err != nil {
+		return err
+	}
+	sel, err := selectionsOf(spec)
+	if err != nil {
+		return err
+	}
+	if spec.ManageRoutes && m.main != nil {
+		if err := m.syncRoutesLocked(spec.Prefixes); err != nil {
+			return err
+		}
+	}
+	m.table.Replace(entries)
+	m.sel = sel
+	specCopy := spec
+	m.spec = &specCopy
+	return nil
+}
+
+// syncRoutesLocked makes the front TUN's routes match prefixes:
+// routes for added prefixes first (rolled back on failure), then
+// removal of routes for dropped ones (best-effort).
+func (m *userspaceMux) syncRoutesLocked(prefixes []api.PrefixSpec) error {
+	link, err := m.main.LinkByName(m.frontName())
+	if err != nil {
+		return fmt.Errorf("find front TUN %s: %w", m.frontName(), err)
+	}
+	want := map[string]*net.IPNet{}
+	var order []string
+	for _, p := range prefixes {
+		_, dst, err := net.ParseCIDR(p.CIDR)
+		if err != nil {
+			return err
+		}
+		if _, dup := want[dst.String()]; !dup {
+			order = append(order, dst.String())
+		}
+		want[dst.String()] = dst
+	}
+	have := map[string]*netlink.Route{}
+	for _, r := range m.routes {
+		have[r.Dst.String()] = r
+	}
+	var added []*netlink.Route
+	for _, k := range order {
+		if _, ok := have[k]; ok {
+			continue
+		}
+		r := &netlink.Route{LinkIndex: link.Attrs().Index, Dst: want[k]}
+		if err := m.main.RouteReplace(r); err != nil {
+			for _, a := range added {
+				m.main.RouteDel(a)
+			}
+			return fmt.Errorf("route %s via front: %w", k, err)
+		}
+		added = append(added, r)
+	}
+	var routes []*netlink.Route
+	for _, r := range m.routes {
+		if _, ok := want[r.Dst.String()]; ok {
+			routes = append(routes, r)
+		} else {
+			m.main.RouteDel(r) // best effort, as in teardown
+		}
+	}
+	m.routes = append(routes, added...)
+	return nil
+}
+
+func (m *userspaceMux) SetSelection(prefix *net.IPNet, sel []api.PeerWeight) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.spec == nil {
+		return fmt.Errorf("mux %q: nothing applied", m.name)
+	}
+	key := steer.KeyOf(prefix)
+	prev, ok := prevSlots(m.table)[key]
+	if !ok {
+		return fmt.Errorf("prefix %s is not steered by mux %q", prefix, m.name)
+	}
+	wp, err := steer.ToWeighted(sel, PeerIDs(*m.spec))
+	if err != nil {
+		return err
+	}
+	if err := m.table.SetSlots(key, steer.BuildSlots(&prev, wp)); err != nil {
+		return err
+	}
+	canon := &net.IPNet{IP: prefix.IP.Mask(prefix.Mask), Mask: prefix.Mask}
+	m.sel[canon.String()] = append([]api.PeerWeight(nil), sel...)
+	return nil
+}
+
+// FlushPeer bumps the peer's pin generation: every flow pinned to it
+// is stale from its next packet on and re-steers through the table.
 func (m *userspaceMux) FlushPeer(peer string) error {
-	return errTODO // userspace engine workstream
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.spec == nil {
+		return fmt.Errorf("mux %q: nothing applied", m.name)
+	}
+	p := m.byName[peer]
+	if p == nil {
+		return fmt.Errorf("mux %q: unknown peer %q", m.name, peer)
+	}
+	p.gen.Add(1)
+	return nil
 }
 
 func (m *userspaceMux) State() (api.State, error) {
-	return api.State{}, errTODO // userspace engine workstream
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	st := api.State{Mux: m.name, Engine: api.EngineUserspace}
+	if m.spec == nil {
+		return st, fmt.Errorf("mux %q: nothing applied", m.name)
+	}
+	names := map[uint32]string{}
+	for _, pspec := range m.spec.Peers {
+		names[pspec.ID] = pspec.Name
+		p := m.byName[pspec.Name]
+		pst := api.PeerState{Name: pspec.Name, ID: pspec.ID}
+		if p != nil && p.dev != nil {
+			dump, err := p.dev.IpcGet()
+			if err != nil {
+				return st, fmt.Errorf("ipcget %s: %w", pspec.Name, err)
+			}
+			parseUAPIState(dump, &pst)
+		}
+		st.Peers = append(st.Peers, pst)
+	}
+	slots := prevSlots(m.table)
+	for _, ps := range m.spec.Prefixes {
+		_, ipnet, err := net.ParseCIDR(ps.CIDR)
+		if err != nil {
+			continue
+		}
+		pst := api.PrefixState{
+			CIDR:       ipnet.String(),
+			Candidates: append([]string(nil), ps.Candidates...),
+			Mode:       ps.EffectiveMode(),
+			Policy:     ps.Policy,
+			Selection:  append([]api.PeerWeight(nil), m.sel[ipnet.String()]...),
+		}
+		if pst.Policy == "" {
+			pst.Policy = api.PolicyStatic
+		}
+		if tbl, ok := slots[steer.KeyOf(ipnet)]; ok {
+			pst.Slots = map[string]int{}
+			for id, n := range tbl.Share() {
+				if name, ok := names[id]; ok {
+					pst.Slots[name] = n
+				}
+			}
+		}
+		st.Prefixes = append(st.Prefixes, pst)
+	}
+	st.Counters = m.counters.snapshot()
+	return st, nil
 }
 
 func (m *userspaceMux) Close() error {
@@ -333,6 +534,7 @@ func (m *userspaceMux) closeLocked() error {
 	m.byName = nil
 	m.table = nil
 	m.flows = nil
+	m.sel = nil
 	return firstErr
 }
 

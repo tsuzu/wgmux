@@ -14,7 +14,9 @@ package steer
 
 import (
 	"encoding/binary"
+	"fmt"
 	"net"
+	"sort"
 	"sync"
 
 	"github.com/tsuzu/wgmux/internal/api"
@@ -46,8 +48,113 @@ type WeightedPeer struct {
 // count (keeping the lowest-indexed ones); only freed slots are
 // reassigned, filled in ascending slot order to peers below target
 // in sel order. Deterministic. An empty sel yields an all-NoPeer table.
+//
+// Duplicate IDs in sel are merged (weights summed, first position
+// kept); NoPeer entries are ignored. With more than Slots distinct
+// peers only the Slots heaviest (ties: earlier in sel) are realized,
+// one slot each; the rest get none.
 func BuildSlots(prev *SlotTable, sel []WeightedPeer) SlotTable {
-	panic("steer.BuildSlots: implemented by the steer workstream")
+	var out SlotTable
+	// Normalize: merge duplicates, drop NoPeer, 0 weight = 1.
+	var peers []WeightedPeer
+	idx := map[uint32]int{}
+	for _, w := range sel {
+		if w.ID == NoPeer {
+			continue
+		}
+		if w.Weight == 0 {
+			w.Weight = 1
+		}
+		if i, ok := idx[w.ID]; ok {
+			peers[i].Weight += w.Weight
+			continue
+		}
+		idx[w.ID] = len(peers)
+		peers = append(peers, w)
+	}
+	if len(peers) == 0 {
+		return out
+	}
+	target := make([]int, len(peers))
+	if len(peers) > Slots {
+		// Pick the Slots heaviest, one slot each.
+		order := make([]int, len(peers))
+		for i := range order {
+			order[i] = i
+		}
+		sort.SliceStable(order, func(a, b int) bool { return peers[order[a]].Weight > peers[order[b]].Weight })
+		for _, i := range order[:Slots] {
+			target[i] = 1
+		}
+	} else {
+		var total uint64
+		for _, w := range peers {
+			total += uint64(w.Weight)
+		}
+		rem := make([]uint64, len(peers))
+		sum := 0
+		for i, w := range peers {
+			x := uint64(w.Weight) * Slots
+			target[i] = int(x / total)
+			rem[i] = x % total
+			sum += target[i]
+		}
+		// Largest remainder; ties by sel order.
+		order := make([]int, len(peers))
+		for i := range order {
+			order[i] = i
+		}
+		sort.SliceStable(order, func(a, b int) bool { return rem[order[a]] > rem[order[b]] })
+		for k := 0; sum < Slots; k++ {
+			target[order[k%len(order)]]++
+			sum++
+		}
+		// Every peer gets >= 1 slot: take from the largest target
+		// (ties: the later peer in sel).
+		for i := range target {
+			if target[i] > 0 {
+				continue
+			}
+			best := -1
+			for j := range target {
+				if target[j] > 1 && (best < 0 || target[j] >= target[best]) {
+					best = j
+				}
+			}
+			target[best]--
+			target[i] = 1
+		}
+	}
+	// Keep: a staying peer retains its lowest-indexed existing slots
+	// up to its target.
+	have := make([]int, len(peers))
+	if prev != nil {
+		for s, id := range prev {
+			i, ok := idx[id]
+			if !ok || have[i] >= target[i] {
+				continue
+			}
+			out[s] = id
+			have[i]++
+		}
+	}
+	// Fill: freed slots ascending, to the first under-target peer in
+	// sel order.
+	pi := 0
+	for s := range out {
+		if out[s] != NoPeer {
+			continue
+		}
+		for pi < len(peers) && have[pi] >= target[pi] {
+			pi++
+		}
+		if pi == len(peers) {
+			break
+		}
+		out[s] = peers[pi].ID
+		have[pi]++
+	}
+	return out
 }
 
 // Share counts the slots each peer ID owns in t (NoPeer excluded).
@@ -87,7 +194,15 @@ func KeyOf(prefix *net.IPNet) SteeringKey {
 
 // ToWeighted resolves an API selection (peer names) to datapath IDs.
 func ToWeighted(sel []api.PeerWeight, ids map[string]uint32) ([]WeightedPeer, error) {
-	panic("steer.ToWeighted: implemented by the steer workstream")
+	out := make([]WeightedPeer, 0, len(sel))
+	for _, w := range sel {
+		id, ok := ids[w.Peer]
+		if !ok || id == NoPeer {
+			return nil, fmt.Errorf("unknown peer %q in selection", w.Peer)
+		}
+		out = append(out, WeightedPeer{ID: id, Weight: w.EffectiveWeight()})
+	}
+	return out, nil
 }
 
 // EntriesFromSpec compiles every prefix's EffectiveSelection into an
@@ -95,7 +210,33 @@ func ToWeighted(sel []api.PeerWeight, ids map[string]uint32) ([]WeightedPeer, er
 // the currently programmed tables by key; it is passed to BuildSlots
 // so an in-place re-apply moves as few slots as possible.
 func EntriesFromSpec(prefixes []api.PrefixSpec, ids map[string]uint32, prev map[SteeringKey]SlotTable) ([]Entry, error) {
-	panic("steer.EntriesFromSpec: implemented by the steer workstream")
+	out := make([]Entry, 0, len(prefixes))
+	seen := map[SteeringKey]string{}
+	for _, p := range prefixes {
+		ip, ipnet, err := net.ParseCIDR(p.CIDR)
+		if err != nil {
+			return nil, fmt.Errorf("prefix %q: %w", p.CIDR, err)
+		}
+		if ip.To4() == nil || len(ipnet.Mask) != net.IPv4len {
+			return nil, fmt.Errorf("prefix %q: only IPv4 is supported", p.CIDR)
+		}
+		ipnet.IP = ipnet.IP.To4()
+		key := KeyOf(ipnet)
+		if other, dup := seen[key]; dup {
+			return nil, fmt.Errorf("prefix %q duplicates %q", p.CIDR, other)
+		}
+		seen[key] = p.CIDR
+		wp, err := ToWeighted(p.EffectiveSelection(), ids)
+		if err != nil {
+			return nil, fmt.Errorf("prefix %s: %w", p.CIDR, err)
+		}
+		var prevp *SlotTable
+		if st, ok := prev[key]; ok {
+			prevp = &st
+		}
+		out = append(out, Entry{PrefixLen: key.PrefixLen, Addr: key.Addr, Slots: BuildSlots(prevp, wp)})
+	}
+	return out, nil
 }
 
 // WireAddr returns an IPv4 address in the u32 representation the
@@ -179,26 +320,62 @@ type Table struct {
 
 // NewTable builds a Table from entries (any order).
 func NewTable(entries []Entry) *Table {
-	panic("steer.NewTable: implemented by the steer workstream")
+	t := &Table{}
+	t.Replace(entries)
+	return t
 }
 
 // Lookup returns the entry governing dst (longest prefix match).
 func (t *Table) Lookup(dst net.IP) (Entry, bool) {
-	panic("steer.Table.Lookup: implemented by the steer workstream")
+	ip := dst.To4()
+	if ip == nil {
+		return Entry{}, false
+	}
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+	for i, n := range t.nets {
+		if n.Contains(ip) {
+			return t.entries[i], true
+		}
+	}
+	return Entry{}, false
 }
 
 // SetSlots replaces one existing prefix's slot table; error if the
 // prefix is not in the table.
 func (t *Table) SetSlots(key SteeringKey, slots SlotTable) error {
-	panic("steer.Table.SetSlots: implemented by the steer workstream")
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	for i := range t.entries {
+		if t.entries[i].Key() == key {
+			t.entries[i].Slots = slots
+			return nil
+		}
+	}
+	return fmt.Errorf("prefix %s not in steering table", (Entry{PrefixLen: key.PrefixLen, Addr: key.Addr}).Prefix())
 }
 
 // Replace swaps the whole entry set atomically (in-place re-apply).
 func (t *Table) Replace(entries []Entry) {
-	panic("steer.Table.Replace: implemented by the steer workstream")
+	es := append([]Entry(nil), entries...)
+	sort.SliceStable(es, func(i, j int) bool {
+		if es[i].PrefixLen != es[j].PrefixLen {
+			return es[i].PrefixLen > es[j].PrefixLen
+		}
+		return es[i].Addr < es[j].Addr
+	})
+	nets := make([]*net.IPNet, len(es))
+	for i, e := range es {
+		nets[i] = e.Prefix()
+	}
+	t.mu.Lock()
+	t.entries, t.nets = es, nets
+	t.mu.Unlock()
 }
 
 // Entries returns a snapshot of the current entries.
 func (t *Table) Entries() []Entry {
-	panic("steer.Table.Entries: implemented by the steer workstream")
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+	return append([]Entry(nil), t.entries...)
 }
