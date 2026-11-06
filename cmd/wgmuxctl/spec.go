@@ -22,10 +22,11 @@ func buildCreate(mux *config.Mux) api.CreateParams {
 
 // buildSpec translates a mux definition into the data plane's
 // desired state: names become IDs, keys are resolved, endpoints are
-// pinned to IPs (resolution happens here, in the control plane),
-// and decision policies (failover, bgp) are normalised to the
-// datapath's "active" form; the control plane drives them
-// afterwards with SetActive calls.
+// pinned to IPs (resolution happens here, in the control plane).
+// Prefixes carry candidate NAMES, mode, policy (informational for
+// the daemon) and the configured initial selection; runtime
+// decisions (failover, bgp, operator) afterwards arrive as
+// SetSelection calls.
 func buildSpec(mux *config.Mux) (api.ApplySpec, error) {
 	spec := api.ApplySpec{
 		Front: api.FrontSpec{
@@ -60,14 +61,17 @@ func buildSpec(mux *config.Mux) (api.ApplySpec, error) {
 		spec.Peers = append(spec.Peers, ps)
 	}
 	for _, prefix := range mux.EffectivePrefixes {
-		// TODO(control-plane workstream): mode/policy/weights from config.
-		pfx := api.PrefixSpec{CIDR: prefix.CIDR, Candidates: prefix.Candidates, Mode: api.ModeSingle, Policy: api.PolicyStatic}
-		if prefix.Policy == config.PolicyHash {
-			pfx.Mode = api.ModeECMP
-		} else {
-			pfx.Selection = []api.PeerWeight{{Peer: prefix.Active, Weight: 1}}
-		}
-		spec.Prefixes = append(spec.Prefixes, pfx)
+		// Names, not IDs: the daemon resolves peers by name. The
+		// configured selection is explicit so the daemon can tell a
+		// config change (selection resets) from a runtime override
+		// (selection survives a re-apply).
+		spec.Prefixes = append(spec.Prefixes, api.PrefixSpec{
+			CIDR:       prefix.CIDR,
+			Candidates: prefix.Candidates,
+			Mode:       prefix.Mode,
+			Policy:     prefix.Policy,
+			Selection:  prefix.Selection(),
+		})
 	}
 	return spec, nil
 }
@@ -79,6 +83,9 @@ func buildSpec(mux *config.Mux) (api.ApplySpec, error) {
 // apply that assumes different ones is rejected here with the
 // reason, instead of silently building something else.
 func checkDaemon(info api.DaemonInfo, intent config.CreationSpec) error {
+	if info.APIVersion != api.Version {
+		return fmt.Errorf("wgmuxd speaks API version %d, this wgmuxctl speaks %d: upgrade or downgrade them together", info.APIVersion, api.Version)
+	}
 	if intent.EngineSet && intent.Engine != info.Engine {
 		return fmt.Errorf("this apply assumes engine %q, but the daemon was started with -engine %s (engine kind is a wgmuxd startup setting; use the daemon started for %q, with its own -socket)",
 			intent.Engine, info.Engine, intent.Engine)
