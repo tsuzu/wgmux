@@ -1,0 +1,14 @@
+[Unit]
+Description=wgmux policy runner (failover monitor + BGP selection source)
+# The runner only drives selections through the daemon's API socket;
+# it needs wgmuxd up, and it is pointless without it.
+After=wgmuxd.service
+Requires=wgmuxd.service
+
+[Service]
+ExecStart=/usr/local/bin/wgmuxctl run -c /etc/wgmux/wgmux.yaml
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target

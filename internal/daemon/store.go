@@ -11,15 +11,22 @@ import (
 	"github.com/tsuzu/wgmux/internal/api"
 )
 
+// StoreVersion is the Record format version this daemon reads/writes.
+const StoreVersion = 2
+
 // Record is one instance's persisted state: its creation
 // parameters and last applied spec. The store is the record of
 // what SHOULD exist; kernel objects are the record of what does.
 type Record struct {
+	Version        int            `json:"version"` // StoreVersion
 	Name           string         `json:"name"`
 	Engine         string         `json:"engine"` // kind of the daemon that wrote it
 	BackendAddress string         `json:"backend_address,omitempty"`
-	Spec           *api.ApplySpec `json:"spec,omitempty"`
-	UpdatedAt      time.Time      `json:"updated_at"`
+	Spec           *api.ApplySpec `json:"spec,omitempty"` // last successfully applied, configured selections
+	// Selections are the runtime selection overrides
+	// (SetSelection), by canonical CIDR.
+	Selections map[string][]api.PeerWeight `json:"selections,omitempty"`
+	UpdatedAt  time.Time                   `json:"updated_at"`
 }
 
 // Store persists Records as one JSON file per instance under

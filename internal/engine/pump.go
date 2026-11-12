@@ -1,6 +1,7 @@
 package engine
 
 import (
+	"container/list"
 	"encoding/binary"
 	"net"
 	"sync"
@@ -33,49 +34,95 @@ func parseFlow(pkt []byte) (steer.FlowKey, bool) {
 	return fk, true
 }
 
+// flowVal is a flow pin: the peer that carries the flow and the
+// peer's generation when the pin was made (flow_peer in the BPF
+// datapath). The pin is honored only while the peer exists and its
+// current generation still equals Gen.
+type flowVal struct {
+	peer uint32
+	gen  uint32
+}
+
 // flowTable pins flows to the peer that carried them, mirroring the
-// BPF flow_peer map. The kernel map is an LRU hash of 65536
-// entries; this is a FIFO-evicted map of the same size — parity is
-// best-effort (eviction order differs), selection of new flows is
-// identical because both consult the same steering entries.
+// BPF flow_peer LRU hash (65536 entries): least-recently-used
+// eviction, bounded. It is sharded by flow hash so the pump's
+// readers (front loop, one writer goroutine per peer) rarely
+// contend; each shard is an independent LRU of cap/shards entries.
 type flowTable struct {
-	mu    sync.Mutex
-	m     map[steer.FlowKey]uint32
-	order []steer.FlowKey // insertion order, oldest first
-	head  int             // index of oldest live entry in order
-	cap   int
+	shards []*flowShard
+}
+
+type flowShard struct {
+	mu  sync.Mutex
+	m   map[steer.FlowKey]*list.Element
+	lru *list.List // front = most recently used
+	cap int
+}
+
+type flowEnt struct {
+	k steer.FlowKey
+	v flowVal
 }
 
 func newFlowTable(capacity int) *flowTable {
-	return &flowTable{m: make(map[steer.FlowKey]uint32), cap: capacity}
+	n := 1
+	if capacity >= 1024 {
+		n = 16
+	}
+	per := capacity / n
+	if per < 1 {
+		per = 1
+	}
+	f := &flowTable{shards: make([]*flowShard, n)}
+	for i := range f.shards {
+		f.shards[i] = &flowShard{m: make(map[steer.FlowKey]*list.Element), lru: list.New(), cap: per}
+	}
+	return f
 }
 
-func (f *flowTable) get(k steer.FlowKey) (uint32, bool) {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	id, ok := f.m[k]
-	return id, ok
+func (f *flowTable) shard(k steer.FlowKey) *flowShard {
+	return f.shards[int(steer.Hash(k)>>8)%len(f.shards)]
 }
 
-func (f *flowTable) put(k steer.FlowKey, peerID uint32) {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	if _, exists := f.m[k]; !exists {
-		f.order = append(f.order, k)
+// get returns the pin for k and marks it recently used.
+func (f *flowTable) get(k steer.FlowKey) (flowVal, bool) {
+	s := f.shard(k)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	el, ok := s.m[k]
+	if !ok {
+		return flowVal{}, false
 	}
-	f.m[k] = peerID
-	// FIFO eviction: a key is queued once, at its first insertion;
-	// re-insertions only update the map value.
-	for len(f.m) > f.cap && f.head < len(f.order) {
-		old := f.order[f.head]
-		f.head++
-		delete(f.m, old)
+	s.lru.MoveToFront(el)
+	return el.Value.(*flowEnt).v, true
+}
+
+// put pins k to v, evicting the least recently used entry when full.
+func (f *flowTable) put(k steer.FlowKey, v flowVal) {
+	s := f.shard(k)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if el, ok := s.m[k]; ok {
+		el.Value.(*flowEnt).v = v
+		s.lru.MoveToFront(el)
+		return
 	}
-	// Compact the order slice occasionally to bound memory.
-	if f.head > 4096 && f.head*2 > len(f.order) {
-		f.order = append([]steer.FlowKey(nil), f.order[f.head:]...)
-		f.head = 0
+	s.m[k] = s.lru.PushFront(&flowEnt{k: k, v: v})
+	for s.lru.Len() > s.cap {
+		old := s.lru.Back()
+		s.lru.Remove(old)
+		delete(s.m, old.Value.(*flowEnt).k)
 	}
+}
+
+func (f *flowTable) len() int {
+	n := 0
+	for _, s := range f.shards {
+		s.mu.Lock()
+		n += len(s.m)
+		s.mu.Unlock()
+	}
+	return n
 }
 
 // pumpCounters are the userspace datapath's observability counters,
@@ -84,16 +131,24 @@ func (f *flowTable) put(k steer.FlowKey, peerID uint32) {
 type pumpCounters struct {
 	frontEntries   atomic.Uint64
 	frontRedirects atomic.Uint64
-	frontDrops     atomic.Uint64
+	frontUnsteered atomic.Uint64
+	frontNoPeer    atomic.Uint64
+	frontPinHits   atomic.Uint64
+	frontPinStale  atomic.Uint64
+	frontDrops     atomic.Uint64 // queue full / closed (userspace only)
 	wgEntries      atomic.Uint64
 	wgRedirects    atomic.Uint64
-	wgDrops        atomic.Uint64
+	wgDrops        atomic.Uint64 // front TUN write failed (userspace only)
 }
 
 func (c *pumpCounters) snapshot() map[string]uint64 {
 	return map[string]uint64{
 		"front_entries":   c.frontEntries.Load(),
 		"front_redirects": c.frontRedirects.Load(),
+		"front_unsteered": c.frontUnsteered.Load(),
+		"front_no_peer":   c.frontNoPeer.Load(),
+		"front_pin_hits":  c.frontPinHits.Load(),
+		"front_pin_stale": c.frontPinStale.Load(),
 		"front_drops":     c.frontDrops.Load(),
 		"wg_entries":      c.wgEntries.Load(),
 		"wg_redirects":    c.wgRedirects.Load(),

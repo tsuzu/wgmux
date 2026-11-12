@@ -43,8 +43,8 @@ func TestParseFRRBestPathsArrayShape(t *testing.T) {
 		t.Fatalf("decisions = %v, want %v", got, want)
 	}
 	for _, d := range got {
-		if want[d.Prefix] != d.WgPeer {
-			t.Errorf("prefix %s -> %s, want %s", d.Prefix, d.WgPeer, want[d.Prefix])
+		if want[d.Prefix] != d.WgPeers[0] {
+			t.Errorf("prefix %s -> %v, want %s", d.Prefix, d.WgPeers, want[d.Prefix])
 		}
 	}
 }
@@ -57,7 +57,7 @@ func TestParseFRRBestPathsObjectShape(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(got) != 1 || got[0].WgPeer != "site-b" {
+	if len(got) != 1 || got[0].WgPeers[0] != "site-b" {
 		t.Fatalf("decisions = %v", got)
 	}
 }
@@ -84,7 +84,7 @@ func TestDecisionsFromWatch(t *testing.T) {
 		},
 	}
 	got := decisionsFromWatch(testCfg(), r)
-	if len(got) != 1 || got[0].Prefix != "10.20.0.10/32" || got[0].WgPeer != "site-b" {
+	if len(got) != 1 || got[0].Prefix != "10.20.0.10/32" || got[0].WgPeers[0] != "site-b" {
 		t.Fatalf("decisions = %v", got)
 	}
 }

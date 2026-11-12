@@ -15,7 +15,10 @@ import (
 )
 
 // GoBGPSource embeds a GoBGP server in the control-plane process and
-// translates its best-path table events into Decisions.
+// translates its best-path table events into Decisions. Watch events
+// carry only the single best path, so every Decision has exactly one
+// peer: ecmp-mode prefixes follow the best path only under gobgp
+// (use the frr source for real multipath).
 type GoBGPSource struct {
 	cfg    *config.Mux
 	server *server.BgpServer
@@ -100,7 +103,7 @@ func decisionsFromWatch(cfg *config.Mux, r *gobgpapi.WatchEventResponse) []Decis
 		if _, _, err := net.ParseCIDR(prefix); err != nil {
 			continue
 		}
-		out = append(out, Decision{Prefix: prefix, WgPeer: peer})
+		out = append(out, Decision{Prefix: prefix, WgPeers: []string{peer}})
 	}
 	return out
 }

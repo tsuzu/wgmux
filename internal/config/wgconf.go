@@ -17,7 +17,7 @@ import (
 //	[Peer]                 the remote site
 //	PublicKey / PresharedKey / AllowedIPs / Endpoint / PersistentKeepalive
 //
-// Exactly one [Peer] section per file is supported (v1): one file
+// Exactly one [Peer] section per file is supported: one file
 // describes one tunnel, which is how wg-quick configs for
 // point-to-point site links are written anyway.
 //
@@ -78,7 +78,7 @@ func parseWGFile(path string) (*wgFile, error) {
 			case "peer":
 				peerSections++
 				if peerSections > 1 {
-					return nil, fmt.Errorf("%s: more than one [Peer] section; wgmux v1 takes exactly one peer per wg config file", path)
+					return nil, fmt.Errorf("%s: more than one [Peer] section; wgmux takes exactly one peer per wg config file", path)
 				}
 			default:
 				return nil, fmt.Errorf("%s:%d: unknown section [%s]", path, lineno+1, section)
