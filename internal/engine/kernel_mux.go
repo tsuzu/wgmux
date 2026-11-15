@@ -2,10 +2,14 @@ package engine
 
 import (
 	"encoding/binary"
+	"encoding/json"
+	"errors"
 	"fmt"
+	"hash/fnv"
 	"net"
 	"os"
 	"path/filepath"
+	"reflect"
 	"sync"
 
 	"github.com/vishvananda/netns"
@@ -43,6 +47,7 @@ type kernelMux struct {
 	topo            *topology.Topology
 	peers           *kernelPeers
 	resolvedBackend string
+	sel             map[string][]api.PeerWeight // canonical CIDR -> current selection
 }
 
 func newKernelMux(params api.CreateParams, opts DaemonOptions) *kernelMux {
@@ -101,28 +106,143 @@ func (m *kernelMux) backendAddress(front string) (string, error) {
 	return m.resolvedBackend, nil
 }
 
-// Apply reconciles the instance to the desired spec by rebuilding
-// it. (Rebuild is the honest v1 semantic: peers are cheap to
-// recreate, and the steering maps are repopulated before re-attach.)
+// canonCIDR returns the canonical (masked) text of a CIDR.
+func canonCIDR(s string) (string, *net.IPNet, error) {
+	_, n, err := net.ParseCIDR(s)
+	if err != nil {
+		return "", nil, fmt.Errorf("prefix %q: %w", s, err)
+	}
+	return n.String(), n, nil
+}
+
+// specHash is the completed-apply marker written to runtime_cfg: FNV-1a
+// 64 over the JSON of the spec with every prefix Selection cleared
+// (selections change at runtime without re-applying, so they are not
+// part of the identity). 0 is reserved for "apply in progress", so a
+// zero hash maps to 1.
+func specHash(spec api.ApplySpec) uint64 {
+	c := spec
+	c.Prefixes = make([]api.PrefixSpec, len(spec.Prefixes))
+	for i, p := range spec.Prefixes {
+		p.Selection = nil
+		c.Prefixes[i] = p
+	}
+	raw, err := json.Marshal(c)
+	if err != nil {
+		raw = []byte(err.Error())
+	}
+	h := fnv.New64a()
+	h.Write(raw)
+	if v := h.Sum64(); v != 0 {
+		return v
+	}
+	return 1
+}
+
+func (m *kernelMux) mtu(spec *api.ApplySpec) int {
+	if spec.Front.MTU == 0 {
+		return 1420
+	}
+	return spec.Front.MTU
+}
+
+// prefixCIDRs returns the canonical CIDR of every prefix.
+func prefixCIDRs(spec *api.ApplySpec) ([]string, error) {
+	out := make([]string, 0, len(spec.Prefixes))
+	for _, p := range spec.Prefixes {
+		c, _, err := canonCIDR(p.CIDR)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, c)
+	}
+	return out, nil
+}
+
+// loadSelections records the in-memory selection of every prefix
+// from a (merged) spec.
+func (m *kernelMux) loadSelections(spec *api.ApplySpec) {
+	m.sel = map[string][]api.PeerWeight{}
+	for _, p := range spec.Prefixes {
+		if c, _, err := canonCIDR(p.CIDR); err == nil {
+			m.sel[c] = append([]api.PeerWeight(nil), p.EffectiveSelection()...)
+		}
+	}
+}
+
+// inPlaceOK reports whether next differs from cur only in prefixes
+// (candidates/modes/selections), so the programs, devices and
+// namespace can stay untouched.
+func inPlaceOK(cur, next *api.ApplySpec) bool {
+	return reflect.DeepEqual(cur.Front, next.Front) &&
+		cur.ManageRoutes == next.ManageRoutes &&
+		reflect.DeepEqual(cur.Peers, next.Peers)
+}
+
+// Apply reconciles the instance to the desired spec. When only the
+// prefixes changed it updates the steering map in place (no device,
+// namespace or program churn; flow pins survive); otherwise it
+// rebuilds. The spec-hash marker is written last, so an interrupted
+// apply is never adoptable.
 func (m *kernelMux) Apply(spec api.ApplySpec) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	h := specHash(spec)
+	if m.spec != nil && m.topo != nil && inPlaceOK(m.spec, &spec) {
+		return m.applyInPlaceLocked(spec, h)
+	}
 	if m.spec != nil {
 		if err := m.teardownLocked(); err != nil {
 			return fmt.Errorf("replace existing state: %w", err)
 		}
+	} else if err := m.purgeLocked(); err != nil {
+		return fmt.Errorf("purge leftovers: %w", err)
 	}
+	return m.rebuildLocked(spec, h)
+}
+
+func (m *kernelMux) applyInPlaceLocked(spec api.ApplySpec, h uint64) error {
+	cidrs, err := prefixCIDRs(&spec)
+	if err != nil {
+		return err
+	}
+	if err := datapath.SetSpecHash(m.kp.PinDir, 0); err != nil {
+		return fmt.Errorf("mark apply in progress: %w", err)
+	}
+	prev, err := datapath.SteeringSnapshot(m.kp.PinDir)
+	if err != nil {
+		return fmt.Errorf("read steering map: %w", err)
+	}
+	entries, err := steer.EntriesFromSpec(spec.Prefixes, PeerIDs(spec), prev)
+	if err != nil {
+		return err
+	}
+	if err := datapath.ReplaceSteering(m.kp.PinDir, entries); err != nil {
+		return fmt.Errorf("replace steering: %w", err)
+	}
+	if spec.ManageRoutes {
+		if err := m.topo.SetPrefixes(cidrs); err != nil {
+			return err
+		}
+	}
+	if err := datapath.SetSpecHash(m.kp.PinDir, h); err != nil {
+		return fmt.Errorf("mark apply complete: %w", err)
+	}
+	specCopy := spec
+	m.spec = &specCopy
+	m.loadSelections(&spec)
+	return nil
+}
+
+func (m *kernelMux) rebuildLocked(spec api.ApplySpec, h uint64) error {
 	backendAddr, err := m.backendAddress(spec.Front.Address)
 	if err != nil {
 		return err
 	}
-	mtu := spec.Front.MTU
-	if mtu == 0 {
-		mtu = 1420
-	}
-	prefixCIDRs := make([]string, 0, len(spec.Prefixes))
-	for _, p := range spec.Prefixes {
-		prefixCIDRs = append(prefixCIDRs, p.CIDR)
+	mtu := m.mtu(&spec)
+	cidrs, err := prefixCIDRs(&spec)
+	if err != nil {
+		return err
 	}
 	topo, err := topology.Open(topology.Params{
 		BackendNS:      m.kp.BackendNS,
@@ -132,12 +252,15 @@ func (m *kernelMux) Apply(spec api.ApplySpec) error {
 		BackendAddress: backendAddr,
 		MTU:            mtu,
 		ManageRoutes:   spec.ManageRoutes,
-		Prefixes:       prefixCIDRs,
+		Prefixes:       cidrs,
 	})
 	if err != nil {
 		return err
 	}
 	fail := func(err error) error {
+		datapath.Unpin(m.kp.PinDir)
+		os.Remove(filepath.Join(m.kp.PinDir, datapath.MapDebug))
+		os.Remove(m.kp.PinDir)
 		topo.Teardown()
 		return err
 	}
@@ -160,7 +283,7 @@ func (m *kernelMux) Apply(spec api.ApplySpec) error {
 		info.PeerIfindex[peer.ID] = ref.Ifindex
 		info.PeerDevice[peer.ID] = ref.DeviceName
 	}
-	entries, err := steer.EntriesFromSpec(spec.Prefixes)
+	entries, err := steer.EntriesFromSpec(spec.Prefixes, PeerIDs(spec), nil)
 	if err != nil {
 		return fail(err)
 	}
@@ -177,10 +300,15 @@ func (m *kernelMux) Apply(spec api.ApplySpec) error {
 			return fail(err)
 		}
 	}
+	// Very last: the completed-apply marker.
+	if err := datapath.SetSpecHash(m.kp.PinDir, h); err != nil {
+		return fail(fmt.Errorf("mark apply complete: %w", err))
+	}
 	m.topo = topo
 	m.peers = peers
 	specCopy := spec
 	m.spec = &specCopy
+	m.loadSelections(&spec)
 	return nil
 }
 
@@ -191,22 +319,109 @@ func (m *kernelMux) teardownLocked() error {
 	if err := datapath.Unpin(m.kp.PinDir); err != nil {
 		firstErr = err
 	}
+	os.Remove(filepath.Join(m.kp.PinDir, datapath.MapDebug))
+	os.Remove(m.kp.PinDir)
 	if err := m.topo.Teardown(); err != nil && firstErr == nil {
 		firstErr = err
 	}
 	m.spec = nil
 	m.topo = nil
 	m.peers = nil
+	m.sel = nil
 	return firstErr
 }
 
-func (m *kernelMux) SetActive(prefix *net.IPNet, peerID uint32) error {
+// Purge removes everything derived from the instance name without
+// needing live handles: pinned maps/links (all of them, debug map
+// included), the backend namespace, and the main-namespace front
+// link — the latter only if it is a veth/netkit. Idempotent.
+func (m *kernelMux) Purge() error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.purgeLocked()
+}
+
+func (m *kernelMux) purgeLocked() error {
+	front := m.name
+	if m.spec != nil {
+		front = m.frontName(m.spec)
+	}
+	var errs []error
+	if err := datapath.Unpin(m.kp.PinDir); err != nil {
+		errs = append(errs, err)
+	}
+	if err := os.Remove(filepath.Join(m.kp.PinDir, datapath.MapDebug)); err != nil && !os.IsNotExist(err) {
+		errs = append(errs, err)
+	}
+	if err := os.Remove(m.kp.PinDir); err != nil && !os.IsNotExist(err) {
+		errs = append(errs, err)
+	}
+	if err := topology.Purge(m.kp.BackendNS, front); err != nil {
+		errs = append(errs, err)
+	}
+	if m.topo != nil {
+		m.topo.Backend.Close()
+		m.topo.Main.Close()
+		nsh := m.topo.BackendNsHandle()
+		nsh.Close()
+	}
+	m.spec, m.topo, m.peers, m.sel = nil, nil, nil, nil
+	return errors.Join(errs...)
+}
+
+// SetSelection compiles the new selection against the live slot
+// table (so only the slots that must move do) and writes it. Pins
+// are untouched: established flows stay (graceful).
+func (m *kernelMux) SetSelection(prefix *net.IPNet, sel []api.PeerWeight) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if m.spec == nil {
 		return fmt.Errorf("mux %q: nothing applied", m.name)
 	}
-	return datapath.SetActive(m.kp.PinDir, prefix, peerID)
+	cidr := prefix.String()
+	var ps *api.PrefixSpec
+	for i := range m.spec.Prefixes {
+		if c, _, err := canonCIDR(m.spec.Prefixes[i].CIDR); err == nil && c == cidr {
+			ps = &m.spec.Prefixes[i]
+			break
+		}
+	}
+	if ps == nil {
+		return fmt.Errorf("mux %q: prefix %s is not steered", m.name, cidr)
+	}
+	one := *ps
+	one.CIDR = cidr
+	one.Selection = sel
+	prev, err := datapath.SteeringSnapshot(m.kp.PinDir)
+	if err != nil {
+		return fmt.Errorf("read steering map: %w", err)
+	}
+	entries, err := steer.EntriesFromSpec([]api.PrefixSpec{one}, PeerIDs(*m.spec), prev)
+	if err != nil {
+		return err
+	}
+	if len(entries) != 1 {
+		return fmt.Errorf("compile selection for %s: got %d entries", cidr, len(entries))
+	}
+	if err := datapath.SetSlots(m.kp.PinDir, entries[0].Key(), entries[0].Slots); err != nil {
+		return err
+	}
+	m.sel[cidr] = append([]api.PeerWeight(nil), sel...)
+	return nil
+}
+
+// FlushPeer invalidates every flow pin to the peer (generation bump).
+func (m *kernelMux) FlushPeer(peer string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.spec == nil {
+		return fmt.Errorf("mux %q: nothing applied", m.name)
+	}
+	id, ok := PeerIDs(*m.spec)[peer]
+	if !ok {
+		return fmt.Errorf("mux %q: unknown peer %q", m.name, peer)
+	}
+	return datapath.BumpPeerGen(m.kp.PinDir, id)
 }
 
 func (m *kernelMux) State() (api.State, error) {
@@ -221,24 +436,32 @@ func (m *kernelMux) State() (api.State, error) {
 		return st, err
 	}
 	st.Peers = peers
-	snap, err := datapath.SteeringSnapshot(m.kp.PinDir)
-	if err != nil {
-		return st, err
+	names := map[uint32]string{}
+	for _, p := range m.spec.Peers {
+		names[p.ID] = p.Name
 	}
+	snap, snapErr := datapath.SteeringSnapshot(m.kp.PinDir)
 	for _, p := range m.spec.Prefixes {
-		ps := api.PrefixState{CIDR: p.CIDR, CandidateIDs: p.CandidateIDs, ActiveID: p.ActiveID, Policy: p.Policy}
-		_, ipnet, err := net.ParseCIDR(p.CIDR)
-		if err == nil {
-			ones, _ := ipnet.Mask.Size()
-			key := steer.SteeringKey{PrefixLen: uint32(ones), Addr: steer.WireAddr(ipnet.IP)}
-			if val, ok := snap[key]; ok {
-				if int(val.Active) < len(val.PeerIDs) {
-					ps.ActiveID = val.PeerIDs[val.Active]
-				}
-				if val.Policy == steer.PolicyHash {
-					ps.Policy = "hash"
-				} else {
-					ps.Policy = "active"
+		cidr, ipnet, cerr := canonCIDR(p.CIDR)
+		sel := p.EffectiveSelection()
+		if cerr == nil {
+			if s, ok := m.sel[cidr]; ok {
+				sel = s
+			}
+		}
+		ps := api.PrefixState{
+			CIDR: p.CIDR, Candidates: p.Candidates, Mode: p.EffectiveMode(),
+			Policy: p.Policy, Selection: append([]api.PeerWeight(nil), sel...),
+		}
+		if cerr == nil && snapErr == nil {
+			if table, ok := snap[steer.KeyOf(ipnet)]; ok {
+				ps.Slots = map[string]int{}
+				for id, n := range table.Share() {
+					name, known := names[id]
+					if !known {
+						name = fmt.Sprintf("id%d", id)
+					}
+					ps.Slots[name] = n
 				}
 			}
 		}
@@ -262,11 +485,13 @@ func (m *kernelMux) Close() error {
 // Adopt re-attaches this instance to kernel objects a previous
 // daemon process left behind (see docs/design.md, "Persistence and
 // recovery"). It probes first — backend namespace present, pin dir
-// present, steering map openable — and only then wires up in-memory
-// handles (topology handles, peer spec table). It never calls
-// datapath.Apply and never reconfigures a device: the datapath is
-// not touched. (false, nil) means the objects are not (fully)
-// there; the caller falls back to a rebuild Apply.
+// present, steering map readable — and requires the spec-hash marker
+// in runtime_cfg to equal the hash of spec, proving the objects are
+// the product of a COMPLETED apply of this same spec (not a crash
+// mid-apply, nor a different spec). Only then does it wire up
+// in-memory handles, peer spec table and selections (from the
+// merged spec). It never calls datapath.Apply and never reconfigures
+// a device. (false, nil) means not adoptable; the caller rebuilds.
 func (m *kernelMux) Adopt(spec api.ApplySpec) (bool, error) {
 	h, err := netns.GetFromName(m.kp.BackendNS)
 	if err != nil {
@@ -284,6 +509,10 @@ func (m *kernelMux) Adopt(spec api.ApplySpec) (bool, error) {
 	if _, err := datapath.SteeringSnapshot(m.kp.PinDir); err != nil {
 		return false, nil
 	}
+	got, err := datapath.SpecHash(m.kp.PinDir)
+	if err != nil || got == 0 || got != specHash(spec) {
+		return false, nil
+	}
 
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -294,14 +523,11 @@ func (m *kernelMux) Adopt(spec api.ApplySpec) (bool, error) {
 	if err != nil {
 		return false, nil
 	}
-	mtu := spec.Front.MTU
-	if mtu == 0 {
-		mtu = 1420
+	cidrs, err := prefixCIDRs(&spec)
+	if err != nil {
+		return false, nil
 	}
-	prefixCIDRs := make([]string, 0, len(spec.Prefixes))
-	for _, p := range spec.Prefixes {
-		prefixCIDRs = append(prefixCIDRs, p.CIDR)
-	}
+	mtu := m.mtu(&spec)
 	topo, err := topology.Open(topology.Params{
 		BackendNS:      m.kp.BackendNS,
 		Interconnect:   m.kp.Interconnect,
@@ -310,7 +536,7 @@ func (m *kernelMux) Adopt(spec api.ApplySpec) (bool, error) {
 		BackendAddress: backendAddr,
 		MTU:            mtu,
 		ManageRoutes:   spec.ManageRoutes,
-		Prefixes:       prefixCIDRs,
+		Prefixes:       cidrs,
 	})
 	if err != nil {
 		return false, nil
@@ -327,5 +553,6 @@ func (m *kernelMux) Adopt(spec api.ApplySpec) (bool, error) {
 	m.peers = peers
 	specCopy := spec
 	m.spec = &specCopy
+	m.loadSelections(&spec)
 	return true, nil
 }

@@ -3,7 +3,7 @@
 // created through the daemon's factory (the daemon is started with
 // ONE engine kind; the factory builds instances of that kind only),
 // it accepts desired state (Apply), single selection changes
-// (SetActive) and reports snapshots (State), without the caller
+// (SetSelection / FlushPeer) and reports snapshots (State), without the caller
 // knowing which implementation it is:
 //
 //   - kernel: in-tree WireGuard devices, one per peer, in a hidden
@@ -28,13 +28,20 @@ import (
 	"github.com/tsuzu/wgmux/internal/config"
 )
 
-// Engine is one mux instance's datapath.
+// Engine is one mux instance's datapath. Peers are addressed by
+// name; datapath peer IDs (api.PeerSpec.ID) are internal.
 type Engine interface {
-	// Apply reconciles the instance to the desired spec,
-	// rebuilding whatever it already had.
+	// Apply reconciles the instance to the desired spec. The daemon
+	// hands it every prefix's Selection already resolved and
+	// validated (never empty). An engine may update in place when
+	// only prefixes/selections changed; otherwise it rebuilds.
 	Apply(spec api.ApplySpec) error
-	// SetActive retargets one prefix to a different candidate peer.
-	SetActive(prefix *net.IPNet, peerID uint32) error
+	// SetSelection replaces one prefix's selection (validated by
+	// the daemon). Established flows stay pinned (graceful).
+	SetSelection(prefix *net.IPNet, sel []api.PeerWeight) error
+	// FlushPeer invalidates every flow pin to the named peer, O(1)
+	// (per-peer generation bump), so its flows re-steer.
+	FlushPeer(peer string) error
 	// State snapshots peers, current selections and counters.
 	State() (api.State, error)
 	// Close tears the instance's datapath down. Idempotent.
@@ -43,11 +50,24 @@ type Engine interface {
 
 // Adopter is implemented by engines whose instances can survive
 // the daemon process (the kernel engine): at startup the daemon
-// offers the stored spec, and Adopt re-attaches to the still-live
-// kernel objects WITHOUT touching the datapath, reporting true.
-// (false, nil) means "not adoptable — rebuild me instead".
+// offers the stored spec (selections merged), and Adopt re-attaches
+// to the still-live kernel objects WITHOUT touching the datapath,
+// reporting true. It must verify the live objects were left by a
+// COMPLETED apply of this same spec (spec hash marker); (false, nil)
+// means "not adoptable — rebuild me instead".
 type Adopter interface {
 	Adopt(spec api.ApplySpec) (bool, error)
+}
+
+// Purger is implemented by engines that can leave objects behind a
+// process (kernel). Purge removes everything derived from the
+// instance name (backend ns, pins, front link) WITHOUT needing live
+// handles — for destroying or rebuilding an instance the daemon
+// holds no engine state for. It never deletes an object it cannot
+// prove is this instance's (e.g. a same-named front link that is
+// not a veth/netkit pair into the instance's backend ns). Idempotent.
+type Purger interface {
+	Purge() error
 }
 
 // DaemonOptions are the daemon-startup settings an engine factory
@@ -90,6 +110,18 @@ func NewFactory(kind string, opts DaemonOptions) (Factory, error) {
 	default:
 		return nil, fmt.Errorf("unknown engine %q", kind)
 	}
+}
+
+// errTODO marks v2 methods the engine workstreams implement.
+var errTODO = fmt.Errorf("engine v2: not implemented yet")
+
+// PeerIDs maps peer name -> datapath ID for a spec.
+func PeerIDs(spec api.ApplySpec) map[string]uint32 {
+	out := make(map[string]uint32, len(spec.Peers))
+	for _, p := range spec.Peers {
+		out[p.Name] = p.ID
+	}
+	return out
 }
 
 // DeviceName is the netdev name for a peer in the backend namespace

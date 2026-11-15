@@ -5,12 +5,12 @@
 // request addresses one instance by name. An instance is created
 // once (Create; the only creation parameter is an optional
 // backend-address override) and afterwards the control plane pushes
-// desired state (Apply), single selection changes (SetActive) and
-// reads snapshots (State).
+// desired state (Apply), single selection changes (SetSelection / FlushPeer)
+// and reads snapshots (State).
 //
 // The split is deliberate: replacing a decision maker (static config,
 // failover logic, GoBGP, FRR) never requires datapath changes, and the
-// datapath does not care where a SetActive call came from.
+// datapath does not care where a SetSelection call came from.
 package api
 
 import (
@@ -21,6 +21,10 @@ import (
 	"net"
 	"time"
 )
+
+// Version is the API contract version. Control-plane tools refuse
+// to drive a daemon reporting a different one (DaemonInfo).
+const Version = 2
 
 // Engine kinds an instance can be created with.
 const (
@@ -76,6 +80,7 @@ type InstanceInfo struct {
 // applies that assume a different engine kind or kernel datapath
 // shape than the daemon was started with.
 type DaemonInfo struct {
+	APIVersion   int    `json:"api_version"` // must equal api.Version
 	Engine       string `json:"engine"`
 	Interconnect string `json:"interconnect,omitempty"` // kernel daemons
 	Attach       string `json:"attach,omitempty"`       // kernel daemons
@@ -99,12 +104,113 @@ type PeerSpec struct {
 	AllowedIPs          []string `json:"allowed_ips"`          // CIDRs, duplicates across peers expected
 }
 
-// PrefixSpec is one steered prefix with resolved candidate peer IDs.
+// Steering modes: how many candidates carry a prefix's traffic at
+// once. The datapath realizes both as a hash-slot table (see
+// steer.Slots); a mode only constrains the selection's shape.
+const (
+	// ModeSingle: exactly one selected peer carries all new flows.
+	ModeSingle = "single"
+	// ModeECMP: one or more selected peers, new flows spread over
+	// them by flow hash in proportion to their weights.
+	ModeECMP = "ecmp"
+)
+
+// Decision policies: WHO changes a prefix's selection at runtime.
+// The data plane never acts on these; they are carried only so the
+// daemon can report them (observability) and policy runners can find
+// the prefixes they own.
+const (
+	PolicyStatic   = "static"   // only operator decisions (apply / select)
+	PolicyFailover = "failover" // handshake-age health monitor
+	PolicyBGP      = "bgp"      // BGP best path(s)
+)
+
+// PeerWeight is one member of a selection. Weight 0 means 1.
+type PeerWeight struct {
+	Peer   string `json:"peer"`
+	Weight uint32 `json:"weight,omitempty"`
+}
+
+// EffectiveWeight returns the weight with the 0-means-1 default.
+func (w PeerWeight) EffectiveWeight() uint32 {
+	if w.Weight == 0 {
+		return 1
+	}
+	return w.Weight
+}
+
+// PrefixSpec is one steered prefix. Peers are always addressed by
+// NAME in the API (names are the stable identity; datapath peer IDs
+// are an implementation detail of the engines).
 type PrefixSpec struct {
-	CIDR         string   `json:"cidr"`
-	CandidateIDs []uint32 `json:"candidate_ids"`
-	ActiveID     uint32   `json:"active_id"`
-	Policy       string   `json:"policy"` // active | hash (datapath form; failover/bgp arrive as active + SetActive)
+	CIDR       string   `json:"cidr"`
+	Candidates []string `json:"candidates"` // peer names allowed to carry this prefix
+	Mode       string   `json:"mode"`       // ModeSingle | ModeECMP ("" = single)
+	Policy     string   `json:"policy"`     // PolicyStatic | PolicyFailover | PolicyBGP (informational)
+	// Selection is the configured (initial) selection. Empty means
+	// DefaultSelection. Engines always receive it resolved and
+	// validated (see EffectiveSelection / ValidateSelection).
+	Selection []PeerWeight `json:"selection,omitempty"`
+}
+
+// EffectiveMode returns the mode with the "" = single default.
+func (p PrefixSpec) EffectiveMode() string {
+	if p.Mode == "" {
+		return ModeSingle
+	}
+	return p.Mode
+}
+
+// DefaultSelection is the selection a prefix gets when none is
+// configured: single → the first candidate; ecmp → every candidate
+// with weight 1.
+func (p PrefixSpec) DefaultSelection() []PeerWeight {
+	if len(p.Candidates) == 0 {
+		return nil
+	}
+	if p.EffectiveMode() == ModeSingle {
+		return []PeerWeight{{Peer: p.Candidates[0], Weight: 1}}
+	}
+	out := make([]PeerWeight, 0, len(p.Candidates))
+	for _, c := range p.Candidates {
+		out = append(out, PeerWeight{Peer: c, Weight: 1})
+	}
+	return out
+}
+
+// EffectiveSelection returns Selection, or DefaultSelection if empty.
+func (p PrefixSpec) EffectiveSelection() []PeerWeight {
+	if len(p.Selection) > 0 {
+		return p.Selection
+	}
+	return p.DefaultSelection()
+}
+
+// ValidateSelection checks sel against the prefix: non-empty, no
+// duplicates, every peer a candidate, and exactly one peer in
+// single mode.
+func (p PrefixSpec) ValidateSelection(sel []PeerWeight) error {
+	if len(sel) == 0 {
+		return fmt.Errorf("prefix %s: empty selection", p.CIDR)
+	}
+	if p.EffectiveMode() == ModeSingle && len(sel) != 1 {
+		return fmt.Errorf("prefix %s: mode single takes exactly one peer, got %d", p.CIDR, len(sel))
+	}
+	cand := map[string]bool{}
+	for _, c := range p.Candidates {
+		cand[c] = true
+	}
+	seen := map[string]bool{}
+	for _, w := range sel {
+		if !cand[w.Peer] {
+			return fmt.Errorf("prefix %s: peer %q is not a candidate", p.CIDR, w.Peer)
+		}
+		if seen[w.Peer] {
+			return fmt.Errorf("prefix %s: peer %q selected twice", p.CIDR, w.Peer)
+		}
+		seen[w.Peer] = true
+	}
+	return nil
 }
 
 // FrontSpec is the one interface visible in the main namespace.
@@ -137,12 +243,16 @@ type PeerState struct {
 	BytesSent     uint64    `json:"bytes_sent"`
 }
 
-// PrefixState is the datapath's current selection for one prefix.
+// PrefixState is the current selection for one prefix.
 type PrefixState struct {
-	CIDR         string   `json:"cidr"`
-	CandidateIDs []uint32 `json:"candidate_ids"`
-	ActiveID     uint32   `json:"active_id"`
-	Policy       string   `json:"policy"`
+	CIDR       string       `json:"cidr"`
+	Candidates []string     `json:"candidates"`
+	Mode       string       `json:"mode"`
+	Policy     string       `json:"policy"`
+	Selection  []PeerWeight `json:"selection"`
+	// Slots is the datapath's ground truth: how many of the
+	// steer.Slots hash slots each peer currently owns.
+	Slots map[string]int `json:"slots,omitempty"`
 }
 
 // State is the full snapshot of one mux instance. Counters are the
@@ -161,19 +271,33 @@ type State struct {
 	Counters map[string]uint64 `json:"counters,omitempty"`
 }
 
-// SetActiveRequest retargets one prefix of one mux to a different
-// candidate peer. This is the single decision point every
-// control-plane policy (manual, failover, BGP) funnels through.
-type SetActiveRequest struct {
-	Mux    string `json:"mux"`
-	CIDR   string `json:"cidr"`
-	PeerID uint32 `json:"peer_id"`
+// SetSelectionRequest replaces one prefix's selection. This is the
+// single decision point every control-plane policy (manual, failover,
+// BGP) funnels through. Established flows stay pinned to the peer
+// they use (graceful); use FlushPeer to move them off a peer.
+type SetSelectionRequest struct {
+	Mux       string       `json:"mux"`
+	CIDR      string       `json:"cidr"`
+	Selection []PeerWeight `json:"selection"`
+}
+
+// FlushPeerRequest invalidates every flow pin to one peer (all
+// prefixes of the instance), so its established flows re-steer by
+// the current selections on their next packet. Failover calls it
+// for a peer it declares dead.
+type FlushPeerRequest struct {
+	Mux  string `json:"mux"`
+	Peer string `json:"peer"`
 }
 
 // ApplyRequest wraps an ApplySpec with its target instance.
+// Runtime selections (SetSelection) survive a re-apply for every
+// prefix whose candidates, mode and configured Selection are
+// unchanged, unless ResetSelections is set.
 type ApplyRequest struct {
-	Mux  string    `json:"mux"`
-	Spec ApplySpec `json:"spec"`
+	Mux             string    `json:"mux"`
+	Spec            ApplySpec `json:"spec"`
+	ResetSelections bool      `json:"reset_selections,omitempty"`
 }
 
 // MuxRequest addresses one instance (destroy/state).
@@ -196,7 +320,8 @@ type Handler interface {
 	Create(params CreateParams) error
 	Apply(req ApplyRequest) error
 	Destroy(req MuxRequest) error
-	SetActive(req SetActiveRequest) error
+	SetSelection(req SetSelectionRequest) error
+	FlushPeer(req FlushPeerRequest) error
 	State(req MuxRequest) (State, error)
 	List() ([]InstanceInfo, error)
 	Info() (DaemonInfo, error)
@@ -261,12 +386,18 @@ func dispatch(h Handler, req request) response {
 			return response{Error: err.Error()}
 		}
 		return wrap(struct{}{}, h.Destroy(mr))
-	case "set_active":
-		var sa SetActiveRequest
-		if err := json.Unmarshal(req.Params, &sa); err != nil {
+	case "set_selection":
+		var sr SetSelectionRequest
+		if err := json.Unmarshal(req.Params, &sr); err != nil {
 			return response{Error: err.Error()}
 		}
-		return wrap(struct{}{}, h.SetActive(sa))
+		return wrap(struct{}{}, h.SetSelection(sr))
+	case "flush_peer":
+		var fr FlushPeerRequest
+		if err := json.Unmarshal(req.Params, &fr); err != nil {
+			return response{Error: err.Error()}
+		}
+		return wrap(struct{}{}, h.FlushPeer(fr))
 	case "state":
 		var mr MuxRequest
 		if err := json.Unmarshal(req.Params, &mr); err != nil {
@@ -326,16 +457,20 @@ func (c *Client) Create(ctx context.Context, params CreateParams) error {
 	return c.call(ctx, "create", params, nil)
 }
 
-func (c *Client) Apply(ctx context.Context, mux string, spec ApplySpec) error {
-	return c.call(ctx, "apply", ApplyRequest{Mux: mux, Spec: spec}, nil)
+func (c *Client) Apply(ctx context.Context, req ApplyRequest) error {
+	return c.call(ctx, "apply", req, nil)
 }
 
 func (c *Client) Destroy(ctx context.Context, mux string) error {
 	return c.call(ctx, "destroy", MuxRequest{Mux: mux}, nil)
 }
 
-func (c *Client) SetActive(ctx context.Context, req SetActiveRequest) error {
-	return c.call(ctx, "set_active", req, nil)
+func (c *Client) SetSelection(ctx context.Context, req SetSelectionRequest) error {
+	return c.call(ctx, "set_selection", req, nil)
+}
+
+func (c *Client) FlushPeer(ctx context.Context, req FlushPeerRequest) error {
+	return c.call(ctx, "flush_peer", req, nil)
 }
 
 func (c *Client) State(ctx context.Context, mux string) (State, error) {

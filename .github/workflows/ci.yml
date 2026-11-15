@@ -24,6 +24,22 @@ jobs:
       - run: go vet ./...
       - run: go test ./...
 
+  integration:
+    # Single-host netns suite (test/integration): kernel veth/netkit +
+    # userspace, real WireGuard and BPF, no containerlab needed.
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.24"
+      - run: sudo modprobe wireguard; sudo modprobe netkit || true
+      - name: Privileged unit + integration tests
+        run: |
+          sudo -E env "PATH=$PATH" WGMUX_TEST_LOAD=1 WGMUX_TEST_KERNEL=1 go test -count=1 ./internal/...
+          sudo -E env "PATH=$PATH" WGMUX_TEST_INTEGRATION=1 go test -tags integration -count=1 -v ./test/integration/
+
   e2e:
     runs-on: ubuntu-latest
     timeout-minutes: 45

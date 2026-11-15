@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os/exec"
+	"sort"
 	"time"
 
 	"github.com/tsuzu/wgmux/internal/config"
@@ -36,7 +37,7 @@ func (s *FRRSource) Run(ctx context.Context, out chan<- Decision) error {
 	if interval <= 0 {
 		interval = 10 * time.Second
 	}
-	last := map[string]string{} // prefix -> peer, to emit only changes
+	last := map[string]string{} // prefix -> decision key, to emit only changes
 	poll := func() error {
 		raw, err := execFn(ctx)
 		if err != nil {
@@ -49,8 +50,8 @@ func (s *FRRSource) Run(ctx context.Context, out chan<- Decision) error {
 		seen := map[string]bool{}
 		for _, d := range decisions {
 			seen[d.Prefix] = true
-			if last[d.Prefix] != d.WgPeer {
-				last[d.Prefix] = d.WgPeer
+			if last[d.Prefix] != d.key() {
+				last[d.Prefix] = d.key()
 				select {
 				case out <- d:
 				case <-ctx.Done():
@@ -98,7 +99,10 @@ type frrPath struct {
 	PeerID   string          `json:"peerId"`
 	BestPath json.RawMessage `json:"bestpath"`
 	BestRaw  *bool           `json:"bestPath"`
-	Nexthops []struct {
+	// Multipath is true on every member of the ECMP set (FRR sets
+	// it on the best path too when multipath is in effect).
+	Multipath bool `json:"multipath"`
+	Nexthops  []struct {
 		IP string `json:"ip"`
 	} `json:"nexthops"`
 }
@@ -122,8 +126,12 @@ func isBest(p frrPath) bool {
 	return false
 }
 
-// ParseFRRBestPaths extracts (prefix, wg peer) decisions from vtysh
-// JSON output. Pure; unit-tested with fixtures.
+// ParseFRRBestPaths extracts (prefix, wg peers) decisions from vtysh
+// JSON output. For each prefix it collects every path marked
+// bestpath or multipath whose neighbor maps to a wgmux peer: the
+// best path's peer first, the other multipath members after it in
+// name order, duplicates removed. Output is sorted by prefix.
+// Pure; unit-tested with fixtures.
 func ParseFRRBestPaths(cfg *config.Mux, raw []byte) ([]Decision, error) {
 	var top struct {
 		Routes map[string]json.RawMessage `json:"routes"`
@@ -146,21 +154,42 @@ func ParseFRRBestPaths(cfg *config.Mux, raw []byte) ([]Decision, error) {
 			}
 			paths = asObj.Paths
 		}
+		neighborOf := func(p frrPath) (string, bool) {
+			n := p.PeerID
+			if n == "" && len(p.Nexthops) > 0 {
+				n = p.Nexthops[0].IP
+			}
+			return NeighborPeer(cfg, n)
+		}
+		var best string
+		var multi []string
+		seen := map[string]bool{}
 		for _, p := range paths {
-			if !isBest(p) {
+			isB, isM := isBest(p), p.Multipath
+			if !isB && !isM {
 				continue
 			}
-			neighbor := p.PeerID
-			if neighbor == "" && len(p.Nexthops) > 0 {
-				neighbor = p.Nexthops[0].IP
-			}
-			peer, ok := NeighborPeer(cfg, neighbor)
-			if !ok {
+			peer, ok := neighborOf(p)
+			if !ok || seen[peer] {
 				continue
 			}
-			out = append(out, Decision{Prefix: prefix, WgPeer: peer})
-			break // one best path per prefix
+			seen[peer] = true
+			if isB {
+				best = peer
+			} else {
+				multi = append(multi, peer)
+			}
+		}
+		sort.Strings(multi)
+		var peers []string
+		if best != "" {
+			peers = append(peers, best)
+		}
+		peers = append(peers, multi...)
+		if len(peers) > 0 {
+			out = append(out, Decision{Prefix: prefix, WgPeers: peers})
 		}
 	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Prefix < out[j].Prefix })
 	return out, nil
 }

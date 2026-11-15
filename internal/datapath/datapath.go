@@ -13,7 +13,6 @@ import (
 	_ "embed"
 	"errors"
 	"fmt"
-	"net"
 	"os"
 	"path/filepath"
 	"strings"
@@ -213,10 +212,6 @@ func Apply(spec Params, info Info, entries []steer.Entry) error {
 	})
 }
 
-func addrBE(ip net.IP) uint32 {
-	return steer.WireAddr(ip)
-}
-
 // loadErr enriches a collection load failure with the tail of the
 // kernel verifier log, which is where the actual reason lives.
 func loadErr(what string, err error) error {
@@ -275,16 +270,16 @@ func backendHandle(nsName string) (*netlink.Handle, error) {
 
 func populate(info Info, entries []steer.Entry, maps map[string]*ebpf.Map) error {
 	for _, e := range entries {
-		if err := maps[MapSteering].Put(e.MapKey(), e.MapVal()); err != nil {
+		if err := maps[MapSteering].Put(e.Key(), e.MapVal()); err != nil {
 			return fmt.Errorf("put steering entry: %w", err)
 		}
 	}
 	for peerID, ifindex := range info.PeerIfindex {
-		if err := maps[MapPeerDev].Put(peerID, uint32(ifindex)); err != nil {
+		if err := maps[MapPeerDev].Put(peerID, steer.PeerVal{Ifindex: uint32(ifindex)}); err != nil {
 			return fmt.Errorf("put peer_dev %d: %w", peerID, err)
 		}
 	}
-	rc := steer.RuntimeCfg{BackIfindex: uint32(info.BackIfindex)}
+	rc := steer.RuntimeCfg{BackIfindex: uint32(info.BackIfindex), SpecHash: 0}
 	rc.FrontMAC = info.FrontMAC
 	rc.BackMAC = info.BackMAC
 	if err := maps[MapRuntimeCfg].Put(uint32(0), rc); err != nil {
@@ -303,13 +298,10 @@ func OpenPinnedSteering(pinDir string) (*ebpf.Map, error) {
 }
 
 // DebugCounterNames names the debug map slots, in index order
-// (indices are defined in bpf/mux.c). The first three from_wg slots
-// after wg_entries are legacy diagnostics of the datapath's
-// development; they stay because the counters cost nothing.
+// (indices are defined in bpf/mux.c).
 var DebugCounterNames = []string{
-	"front_entries", "front_framed", "front_strips", "front_last_len",
-	"front_last_word0", "front_after_len", "front_after_word0", "front_redirects",
-	"wg_entries", "wg_cfg_fail", "wg_grow_fail", "wg_store_fail", "wg_redirects",
+	"front_entries", "front_redirects", "front_unsteered", "front_no_peer",
+	"front_pin_hits", "front_pin_stale", "wg_entries", "wg_redirects", "wg_cfg_fail",
 }
 
 // Counters reads the pinned debug map and returns the counters by
@@ -345,56 +337,6 @@ func DebugSnapshot(pinDir string) ([]uint64, error) {
 	return out, nil
 }
 
-// SetActive flips the active candidate of one prefix in the pinned
-// steering map. peerID identifies the candidate by its position in the
-// entry's PeerIDs, so this works without the config file.
-func SetActive(pinDir string, prefix *net.IPNet, peerID uint32) error {
-	ones, _ := prefix.Mask.Size()
-	key := steer.SteeringKey{
-		PrefixLen: uint32(ones),
-		Addr:      addrBE(prefix.IP),
-	}
-	m, err := OpenPinnedSteering(pinDir)
-	if err != nil {
-		return err
-	}
-	defer m.Close()
-	var val steer.SteeringVal
-	if err := m.Lookup(key, &val); err != nil {
-		return fmt.Errorf("prefix %s not in steering map: %w", prefix, err)
-	}
-	for i := 0; i < int(val.Count) && i < len(val.PeerIDs); i++ {
-		if val.PeerIDs[i] == peerID {
-			val.Active = uint8(i)
-			if err := m.Put(key, val); err != nil {
-				return fmt.Errorf("update steering map: %w", err)
-			}
-			return nil
-		}
-	}
-	return fmt.Errorf("peer %d is not a candidate for prefix %s", peerID, prefix)
-}
-
-// SteeringSnapshot reads all steering entries (for status display).
-func SteeringSnapshot(pinDir string) (map[steer.SteeringKey]steer.SteeringVal, error) {
-	m, err := OpenPinnedSteering(pinDir)
-	if err != nil {
-		return nil, err
-	}
-	defer m.Close()
-	out := map[steer.SteeringKey]steer.SteeringVal{}
-	var key steer.SteeringKey
-	var val steer.SteeringVal
-	it := m.Iterate()
-	for it.Next(&key, &val) {
-		out[key] = val
-	}
-	if err := it.Err(); err != nil {
-		return nil, err
-	}
-	return out, nil
-}
-
 // Unpin removes pinned maps and links created by Apply.
 func Unpin(pinDir string) error {
 	var errs []error
@@ -411,7 +353,7 @@ func Unpin(pinDir string) error {
 		}
 		os.Remove(linksDir)
 	}
-	for _, name := range []string{MapSteering, MapFlowPeer, MapPeerDev, MapRuntimeCfg} {
+	for _, name := range []string{MapSteering, MapFlowPeer, MapPeerDev, MapRuntimeCfg, MapDebug} {
 		if err := os.Remove(filepath.Join(pinDir, name)); err != nil && !os.IsNotExist(err) {
 			errs = append(errs, err)
 		}
